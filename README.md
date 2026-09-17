@@ -11,8 +11,17 @@ where this port differs.
 
 ## Disclaimer
 
+[❗] This was entirely vibe-coded with ZERO human verification or validation. This software is provided "as is," which is
+legal-speak for "I am not responsible if it breaks anything". Seriously, if this fries your sensor or your computer,
+that's on you.
+
 This work is not intended to be used in professional environments, and there are no guarantees on
 its functionalities. Please do not rely on it for medical purposes or professional usage.
+
+## `experimental_v2` branch
+
+The `experimental_v2` branch contains Claude's bug fixes on top of `master`, applied per a
+spec-audit triage.
 
 ## Install
 
