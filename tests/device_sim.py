@@ -42,6 +42,7 @@ REG_REVISION_ID = 0xFE
 REG_PART_ID = 0xFF
 
 RESET_BIT = 0x40
+TEMP_EN_BIT = 0x01
 
 # Registers that never change, regardless of resets or writes.
 _FIXED_REGISTERS = {
@@ -97,6 +98,14 @@ class DeviceSim:
                 # avoids an infinite poll loop in soft_reset()).
                 self._reset_to_defaults()
                 value &= ~RESET_BIT & 0xFF
+            elif reg == REG_DIE_TEMP_CONFIG and (value & TEMP_EN_BIT):
+                # Datasheet: TEMP_EN self-clears once the temperature
+                # conversion completes. Modeled as completing instantly,
+                # same rationale as RESET above -- this also means
+                # read_temperature()'s new TEMP_EN poll (see
+                # SPEC_AUDIT_TRIAGE.md D3) exits on its first check rather
+                # than running out its 100ms timeout in every test.
+                value &= ~TEMP_EN_BIT & 0xFF
             self._set(reg, value)
         else:
             raise ValueError(
@@ -137,6 +146,15 @@ class DeviceSim:
     def push_fifo_bytes(self, data):
         """Queue raw bytes to be served by subsequent FIFO_DATA reads."""
         self._fifo_queue.extend(data)
+
+    def set_die_temperature(self, int_reg_value, frac_reg_value=0):
+        """Poke raw TINT/TFRAC register bytes (e.g. 0xF6 for -10 degC, per
+        Table 10's two's-complement encoding)."""
+        self._registers[REG_DIE_TEMP_INT] = int_reg_value & 0xFF
+        self._registers[REG_DIE_TEMP_FRAC] = frac_reg_value & 0xFF
+
+    def set_overflow_counter(self, value):
+        self._registers[REG_FIFO_OVERFLOW] = value & 0xFF
 
     def _pop_fifo(self, n_bytes):
         out = bytearray()

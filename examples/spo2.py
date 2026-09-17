@@ -25,24 +25,61 @@ I2C_BUS = 1
 # about a 2-second window -- long enough to reliably span a few heartbeats.
 WINDOW_SIZE = 100
 
+# Recompute every N new samples instead of on every single one, so the
+# window actually slides instead of being thrown away and refilled from
+# scratch each time (SPEC_AUDIT_TRIAGE.md A10). ~0.5s at the defaults.
+RECOMPUTE_EVERY = 25
+
+# Signal-quality gate (SPEC_AUDIT_TRIAGE.md A9): without a floor on both
+# the IR DC level and the perfusion index, an empty sensor still prints a
+# confident-looking, meaningless SpO2 percentage. Both thresholds are
+# rough starting points (the SparkFun examples this port descends from use
+# ~50000 counts as their "finger present" DC floor) and need tuning
+# against real hardware -- unverifiable without a sensor.
+IR_DC_FINGER_PRESENT_MIN = 50000  # ADC counts
+PERFUSION_INDEX_MIN = 0.002  # 0.2%
+
+
+def _percentile_spread_ac(samples):
+    """Estimate the AC (pulsatile) amplitude as the 5th-to-95th percentile
+    spread of the window, instead of the full peak-to-peak (max - min)
+    swing this replaced.
+
+    A single motion-spike outlier becomes the new min or max and sets the
+    peak-to-peak swing for the *entire* window; a percentile spread
+    instead drops the top/bottom ~5% of samples (a spike among 100 samples
+    lands within that dropped 5%), so one bad sample doesn't dominate the
+    estimate the way max-min does. An RMS estimate was considered too
+    (also in SPEC_AUDIT_TRIAGE.md A5) but rejected: because RMS sums
+    squared deviations, one sufficiently large spike still dominates it,
+    just less severely than max-min.
+    """
+    ordered = sorted(samples)
+    n = len(ordered)
+    lo = ordered[int(0.05 * (n - 1))]
+    hi = ordered[int(0.95 * (n - 1))]
+    return hi - lo
+
 
 def compute_spo2(red_samples, ir_samples):
     """Estimate SpO2 (%) from equal-length windows of RED/IR samples.
 
-    Returns None if the window doesn't contain a usable pulsatile signal
-    (e.g. no finger on the sensor).
+    Returns (spo2, perfusion_index), or (None, perfusion_index) if the
+    window doesn't look like it has a finger on it (see
+    IR_DC_FINGER_PRESENT_MIN / PERFUSION_INDEX_MIN above).
     """
     red_dc = sum(red_samples) / len(red_samples)
     ir_dc = sum(ir_samples) / len(ir_samples)
     if red_dc == 0 or ir_dc == 0:
-        return None
+        return None, 0.0
 
-    # AC component approximated as peak-to-peak swing within the window.
-    red_ac = max(red_samples) - min(red_samples)
-    ir_ac = max(ir_samples) - min(ir_samples)
-    if ir_ac == 0:
-        # No pulsatile signal at all -- almost certainly no finger present.
-        return None
+    red_ac = _percentile_spread_ac(red_samples)
+    ir_ac = _percentile_spread_ac(ir_samples)
+    perfusion_index = ir_ac / ir_dc
+
+    if ir_dc < IR_DC_FINGER_PRESENT_MIN or perfusion_index < PERFUSION_INDEX_MIN:
+        # No finger present, or too weak/noisy a signal to trust.
+        return None, perfusion_index
 
     r = (red_ac / red_dc) / (ir_ac / ir_dc)
 
@@ -51,7 +88,7 @@ def compute_spo2(red_samples, ir_samples):
     # approximation, not a calibrated conversion -- real pulse oximeters
     # are calibrated against a reference device per unit.
     spo2 = -45.060 * r * r + 30.354 * r + 94.845
-    return max(0.0, min(100.0, spo2))
+    return max(0.0, min(100.0, spo2)), perfusion_index
 
 
 def main():
@@ -75,23 +112,31 @@ def main():
 
         red_window = deque(maxlen=WINDOW_SIZE)
         ir_window = deque(maxlen=WINDOW_SIZE)
+        samples_since_compute = 0
 
         while True:
             sensor.check()
             while sensor.available():
                 red_window.append(sensor.pop_red_from_storage())
                 ir_window.append(sensor.pop_ir_from_storage())
+                samples_since_compute += 1
 
-            if len(red_window) == WINDOW_SIZE:
-                spo2 = compute_spo2(list(red_window), list(ir_window))
+            # The deques themselves already slide (maxlen evicts the
+            # oldest sample as new ones arrive) -- recompute periodically
+            # instead of on every single new sample, rather than clearing
+            # and refilling from scratch each time (SPEC_AUDIT_TRIAGE.md
+            # A10).
+            if len(red_window) == WINDOW_SIZE and samples_since_compute >= RECOMPUTE_EVERY:
+                spo2, perfusion_index = compute_spo2(list(red_window), list(ir_window))
                 if spo2 is not None:
-                    print("SpO2 ~ {:.1f}%".format(spo2))
+                    print("SpO2 ~ {:.1f}% (perfusion index {:.3f}%)".format(
+                        spo2, perfusion_index * 100
+                    ))
                 else:
-                    print("No finger detected / signal too weak")
-                # Slide the window forward instead of recomputing on every
-                # single new sample.
-                red_window.clear()
-                ir_window.clear()
+                    print("No finger detected / signal too weak (perfusion index {:.3f}%)".format(
+                        perfusion_index * 100
+                    ))
+                samples_since_compute = 0
 
 
 if __name__ == "__main__":

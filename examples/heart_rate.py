@@ -14,20 +14,52 @@ I2C_BUS = 1
 
 
 class HeartRateMonitor:
-    """A simple heart rate monitor that uses a moving window to smooth the signal and find peaks."""
+    """A simple heart rate monitor that uses a moving window to smooth the signal and find peaks.
 
-    def __init__(self, sample_rate=100, window_size=10, smoothing_window=5):
+    `sample_rate` must be the sensor's actual acquisition rate (samples/sec
+    arriving in the host buffer), not a guess -- pass
+    `sensor.get_acquisition_frequency()`. It's used for two things that
+    were previously unreliable (see SPEC_AUDIT_TRIAGE.md):
+
+    - A1: peaks are timestamped by sample index (sample_count / sample_rate),
+      not wall-clock time at drain time. Samples can arrive in irregular,
+      host-scheduled bursts (e.g. anything with a sleep() in its poll
+      loop), so wall-clock time at the moment a batch happens to be
+      drained is not when the samples were actually acquired -- sample
+      index against the sensor's own rate is.
+    - A3: a slow (~1s) moving average is subtracted from each raw sample
+      before the existing short-window smoothing, so the peak threshold
+      tracks the pulsatile (AC) component instead of drifting with the
+      baseline (finger pressure settling, slow motion, ambient light).
+    """
+
+    REFRACTORY_MS = 300  # reject a peak within 200 BPM of the last one (A2)
+
+    def __init__(self, sample_rate, window_size=10, smoothing_window=5, dc_window=None):
         self.sample_rate = sample_rate
         self.window_size = window_size
         self.smoothing_window = smoothing_window
-        self.samples = []
+        self.dc_window = dc_window or max(1, int(round(sample_rate)))
+
+        self._raw_samples = []  # backs the DC moving average only
+        self.samples = []  # DC-removed ("AC") samples
         self.timestamps = []
         self.filtered_samples = []
+        self._sample_index = 0
+        self._last_peak_time = None
 
     def add_sample(self, sample):
         """Add a new sample to the monitor."""
-        timestamp = time.monotonic_ns() // 1_000_000
-        self.samples.append(sample)
+        timestamp = self._sample_index * 1000.0 / self.sample_rate
+        self._sample_index += 1
+
+        self._raw_samples.append(sample)
+        if len(self._raw_samples) > self.dc_window:
+            self._raw_samples.pop(0)
+        dc_estimate = sum(self._raw_samples) / len(self._raw_samples)
+        ac_sample = sample - dc_estimate
+
+        self.samples.append(ac_sample)
         self.timestamps.append(timestamp)
 
         # Apply smoothing
@@ -37,7 +69,7 @@ class HeartRateMonitor:
             )
             self.filtered_samples.append(smoothed_sample)
         else:
-            self.filtered_samples.append(sample)
+            self.filtered_samples.append(ac_sample)
 
         # Maintain the size of samples and timestamps
         if len(self.samples) > self.window_size:
@@ -60,6 +92,7 @@ class HeartRateMonitor:
             min_val + (max_val - min_val) * 0.5
         )  # 50% between min and max as a threshold
 
+        last_peak_time = self._last_peak_time
         for i in range(1, len(self.filtered_samples) - 1):
             if (
                 self.filtered_samples[i] > threshold
@@ -67,8 +100,21 @@ class HeartRateMonitor:
                 and self.filtered_samples[i] > self.filtered_samples[i + 1]
             ):
                 peak_time = self.timestamps[i]
+                # Refractory period (A2): reject a local maximum too close
+                # to the last accepted peak. The classic PPG false
+                # positive is the dicrotic notch -- a second, smaller local
+                # max on the same heartbeat's downstroke -- which would
+                # otherwise double-count the beat and roughly double the
+                # reported BPM.
+                if (
+                    last_peak_time is not None
+                    and peak_time - last_peak_time < self.REFRACTORY_MS
+                ):
+                    continue
                 peaks.append((peak_time, self.filtered_samples[i]))
+                last_peak_time = peak_time
 
+        self._last_peak_time = last_peak_time
         return peaks
 
     def calculate_heart_rate(self):
@@ -122,8 +168,10 @@ def main():
         # Set LED brightness to a medium value
         sensor.set_active_leds_amplitude(MAX30105_PULSE_AMP_MEDIUM)
 
-        # Expected acquisition rate: 400 Hz / 8 = 50 Hz
-        actual_acquisition_rate = int(sensor_sample_rate / sensor_fifo_average)
+        # Ask the sensor for its own bookkeeping instead of recomputing
+        # sample_rate/fifo_average ourselves, so this stays correct if the
+        # configuration above changes (SPEC_AUDIT_TRIAGE.md A1).
+        actual_acquisition_rate = sensor.get_acquisition_frequency()
 
         time.sleep(1)
 

@@ -263,3 +263,207 @@ def test_scan_finds_device_and_skips_others():
     bus2 = _RaisingOnOthers(device)
     found = mod.scan(bus2, start=0x50, end=0x60)
     assert found == [0x57]
+
+
+# --------------------------------------------------------------------------
+# SPEC_AUDIT_TRIAGE.md D2/D3 -- read_temperature(): signed TINT, masked
+# TFRAC, and the TEMP_EN poll (DeviceSim self-clears it instantly, so this
+# always takes the fast path -- see device_sim.py).
+# --------------------------------------------------------------------------
+
+def test_read_temperature_decodes_negative_integer_part():
+    sensor, device, _ = _make_sensor()
+    device.set_die_temperature(0xF6, 0x08)  # -10 degC, two's complement
+    assert sensor.read_temperature() == -9.5
+
+
+def test_read_temperature_masks_tfrac_to_4_bits():
+    sensor, device, _ = _make_sensor()
+    device.set_die_temperature(0x19, 0xFF)  # TFRAC only defines bits [3:0]
+    assert sensor.read_temperature() == 25.0 + 0x0F * 0.0625
+
+
+def test_read_temperature_positive_integer_part_unaffected():
+    sensor, device, _ = _make_sensor()
+    device.set_die_temperature(0x1E, 0x02)  # +30.125 degC
+    assert sensor.read_temperature() == 30.125
+
+
+# --------------------------------------------------------------------------
+# SPEC_AUDIT_TRIAGE.md D5 -- led_mode=3 warns (MAX30105-only feature)
+# --------------------------------------------------------------------------
+
+def test_led_mode_3_warns():
+    sensor, _, _ = _make_sensor()
+    with pytest.warns(UserWarning, match="MAX30105-only"):
+        sensor.set_led_mode(3)
+
+
+def test_led_mode_1_and_2_do_not_warn(recwarn):
+    sensor, _, _ = _make_sensor()
+    sensor.set_led_mode(1)
+    sensor.set_led_mode(2)
+    assert len(recwarn) == 0
+
+
+# --------------------------------------------------------------------------
+# SPEC_AUDIT_TRIAGE.md D6 -- (sample_rate, pulse_width) legality per mode,
+# and setup_sensor()'s pulse-width-before-sample-rate write order.
+# --------------------------------------------------------------------------
+
+def test_setup_sensor_writes_pulse_width_before_sample_rate():
+    sensor, _, _ = _make_sensor()
+    call_order = []
+    original_pulse_width = sensor.set_pulse_width
+    original_sample_rate = sensor.set_sample_rate
+
+    def spy_pulse_width(*args, **kwargs):
+        call_order.append("pulse_width")
+        return original_pulse_width(*args, **kwargs)
+
+    def spy_sample_rate(*args, **kwargs):
+        call_order.append("sample_rate")
+        return original_sample_rate(*args, **kwargs)
+
+    sensor.set_pulse_width = spy_pulse_width
+    sensor.set_sample_rate = spy_sample_rate
+
+    sensor.setup_sensor()
+
+    assert call_order == ["pulse_width", "sample_rate"]
+
+
+def test_illegal_rate_pulse_width_pair_raises_in_spo2_mode():
+    # Table 11 (pag. 23): 1600 sps is only legal at 69us in SpO2 mode.
+    sensor, _, _ = _make_sensor()
+    with pytest.raises(ValueError, match="not legal"):
+        sensor.setup_sensor(led_mode=2, sample_rate=1600, pulse_width=411)
+
+
+def test_3200_sps_is_illegal_at_every_pulse_width_in_spo2_mode():
+    sensor, _, _ = _make_sensor()
+    sensor.set_led_mode(2)
+    sensor.set_pulse_width(69)
+    with pytest.raises(ValueError, match="not legal"):
+        sensor.set_sample_rate(3200)
+
+
+def test_3200_sps_is_legal_at_69us_in_hr_mode():
+    sensor, _, _ = _make_sensor()
+    sensor.set_led_mode(1)
+    sensor.set_pulse_width(69)
+    sensor.set_sample_rate(3200)  # must not raise
+    assert sensor._sample_rate == 3200
+
+
+def test_rate_pulse_width_check_skipped_before_led_mode_is_known():
+    sensor, _, _ = _make_sensor()
+    # No setup_sensor()/set_led_mode() yet: _active_leds is still None, so
+    # there's no mode to validate against yet -- must not raise.
+    sensor.set_sample_rate(3200)
+    sensor.set_pulse_width(411)
+
+
+# --------------------------------------------------------------------------
+# SPEC_AUDIT_TRIAGE.md D7 -- OVF_COUNTER accessor, check() returns a count
+# --------------------------------------------------------------------------
+
+def test_get_overflow_count_reads_register():
+    sensor, device, _ = _make_sensor()
+    device.set_overflow_counter(7)
+    assert sensor.get_overflow_count() == 7
+
+
+def test_check_returns_number_of_samples_read():
+    sensor, device, _ = _make_sensor()
+    sensor.setup_sensor(led_mode=2)
+    _stage_samples(device, [
+        (0, 0, 1, 0, 0, 2),
+        (0, 0, 3, 0, 0, 4),
+        (0, 0, 5, 0, 0, 6),
+    ])
+    assert sensor.check() == 3
+
+
+def test_check_returns_zero_falsy_when_no_new_data():
+    sensor, _, _ = _make_sensor()
+    sensor.setup_sensor(led_mode=2)
+    result = sensor.check()
+    assert result == 0
+    assert not result
+
+
+# --------------------------------------------------------------------------
+# SPEC_AUDIT_TRIAGE.md D9 -- host-side buffer matches the device's 32-deep
+# FIFO instead of upstream's MicroPython-memory-budget value of 4.
+# --------------------------------------------------------------------------
+
+def test_storage_queue_size_matches_device_fifo_depth():
+    assert mod.STORAGE_QUEUE_SIZE == 32
+
+
+def test_buffer_retains_a_full_32_sample_burst():
+    # Exercises CircularBuffer/STORAGE_QUEUE_SIZE directly rather than via
+    # check(): the device's own FIFO write/read pointers are 5-bit (pag.
+    # 16), so a single check() call can only ever observe a 0-31 sample
+    # backlog, never a full 32 -- 32 new samples is indistinguishable from
+    # 0 by pointer difference alone (see SPEC_AUDIT_TRIAGE.md D8). That
+    # device-side ambiguity is orthogonal to what this test is checking:
+    # that the host-side buffer itself doesn't start evicting before 32.
+    sensor, _, _ = _make_sensor()
+    for n in range(40):
+        sensor.sense.red.append(n)
+    assert len(sensor.sense.red) == 32
+    assert sensor.available() == 32
+
+
+# --------------------------------------------------------------------------
+# SPEC_AUDIT_TRIAGE.md D11 -- soft_reset() resets cached config fields to
+# their POR equivalents instead of leaving them stale.
+# --------------------------------------------------------------------------
+
+def test_soft_reset_resets_cached_config_to_por_defaults():
+    sensor, _, _ = _make_sensor()
+    sensor.setup_sensor(led_mode=2, sample_rate=400, pulse_width=411, sample_avg=8)
+
+    sensor.soft_reset()
+
+    assert sensor._active_leds is None
+    assert sensor._multi_led_read_mode is None
+    assert sensor._pulse_width_us == 69
+    assert sensor._sample_rate == 50
+    assert sensor._sample_avg == 1
+    assert sensor.get_acquisition_frequency() == 50.0
+
+
+def test_fifo_bytes_to_int_does_not_crash_right_after_soft_reset():
+    sensor, _, _ = _make_sensor()
+    sensor.soft_reset()
+    # Would previously raise TypeError (`3 - None`) on the stale cache.
+    sensor.fifo_bytes_to_int(b"\xFF\xFF\xFF")
+
+
+# --------------------------------------------------------------------------
+# SPEC_AUDIT_TRIAGE.md A11 -- read_sample() returns a matched (red, ir) pair
+# --------------------------------------------------------------------------
+
+def test_read_sample_returns_matched_pair():
+    sensor, device, _ = _make_sensor()
+    sensor.setup_sensor(led_mode=2, pulse_width=411)
+    _stage_samples(device, [
+        (0x00, 0x00, 0x10, 0x00, 0x00, 0x20),
+    ])
+    assert sensor.read_sample() == (0x10, 0x20)
+
+
+def test_read_sample_returns_none_on_timeout():
+    sensor, _, _ = _make_sensor()
+    sensor.setup_sensor(led_mode=2)
+    assert sensor.read_sample() is None
+
+
+def test_read_sample_requires_at_least_two_active_leds():
+    sensor, _, _ = _make_sensor()
+    sensor.setup_sensor(led_mode=1)
+    with pytest.raises(ValueError):
+        sensor.read_sample()

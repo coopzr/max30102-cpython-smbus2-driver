@@ -1,13 +1,15 @@
 # Python (CPython + smbus2) port of:
 # https://github.com/n-elia/MAX30102-MicroPython-driver (v0.5.1, commit facf222)
 #
-# That MicroPython driver is the source of truth for this port's I2C wire
-# protocol: every register access below reproduces its exact read/write
-# shape (see i2c_read_register / i2c_set_register). Only what MicroPython's
-# standard library provides and CPython's does not -- machine.SoftI2C,
-# ustruct, utime, ucollections.deque -- has been translated. See this
-# repository's README for the full list of deviations from upstream (there
-# are two, and neither touches the wire protocol).
+# That MicroPython driver was the starting point for this port's I2C wire
+# protocol: every register access below originally reproduced its exact
+# read/write shape (see i2c_read_register / i2c_set_register), and most
+# still do. A handful of accuracy/usability fixes from SPEC_AUDIT_TRIAGE.md
+# (D2/D3/D5/D6/D7/D9/D11 -- die temperature sign, the temperature-ready
+# poll, led_mode=3, sample-rate/pulse-width validation, OVF_COUNTER,
+# the host-side buffer depth, and stale config caching) now intentionally
+# diverge from upstream; each is called out at its own definition. See this
+# repository's README for the full list of deviations from upstream.
 #
 # Upstream is itself based on:
 # - https://github.com/sparkfun/SparkFun_MAX3010x_Sensor_Library
@@ -26,6 +28,7 @@
 #   The MicroPython port this driver is, in turn, ported from.       n-elia
 
 import time
+import warnings
 from struct import unpack
 
 from smbus2 import SMBus, i2c_msg
@@ -51,8 +54,8 @@ MAX30105_FIFO_DATA = 0x07
 MAX30105_FIFO_CONFIG = 0x08
 MAX30105_MODE_CONFIG = 0x09
 MAX30105_PARTICLE_CONFIG = 0x0A  # Sometimes listed as 'SPO2' in datasheet (pag.11)
-MAX30105_LED1_PULSE_AMP = 0x0C  # IR
-MAX30105_LED2_PULSE_AMP = 0x0D  # RED
+MAX30105_LED1_PULSE_AMP = 0x0C  # RED
+MAX30105_LED2_PULSE_AMP = 0x0D  # IR
 MAX30105_LED3_PULSE_AMP = 0x0E  # GREEN (when available)
 MAX30105_LED_PROX_AMP = 0x10
 MAX30105_MULTI_LED_CONFIG_1 = 0x11
@@ -91,6 +94,9 @@ MAX30105_INT_PROX_INT_DISABLE = 0x00
 MAX30105_INT_DIE_TEMP_RDY_MASK = ~0b00000010
 MAX30105_INT_DIE_TEMP_RDY_ENABLE = 0x02
 MAX30105_INT_DIE_TEMP_RDY_DISABLE = 0x00
+
+# Die Temperature Config: self-clearing "start a conversion" bit (pag. 22)
+MAX30105_TEMP_EN = 0x01
 
 # FIFO data queue configuration
 MAX30105_SAMPLE_AVG_MASK = ~0b11100000
@@ -164,8 +170,31 @@ SLOT_GREEN_PILOT = 0x07
 
 MAX_30105_EXPECTED_PART_ID = 0x15
 
-# Size of the queued readings
-STORAGE_QUEUE_SIZE = 4
+# Size of the queued readings. Matches the device's own 32-deep FIFO
+# (datasheet p.9) rather than upstream's MicroPython-memory-budget value of
+# 4, so a host that doesn't poll on every sample interval (e.g. any loop
+# with a sleep in it) doesn't silently drop most of what the sensor
+# collected -- see SPEC_AUDIT_TRIAGE.md D9. Pure host-side bookkeeping, no
+# I2C traffic depends on this value.
+STORAGE_QUEUE_SIZE = 32
+
+# Sample-rate legality per pulse width, by mode (datasheet p.23, Tables 11
+# and 12): HR mode (led_mode=1) allows more (rate, pulse width) pairs than
+# SpO2/multi-LED mode (led_mode=2/3, which share SpO2 mode's particle-
+# sensing timing). An illegal pair is silently clamped by the chip itself
+# (p.19) rather than rejected, so without this check a caller's requested
+# sample rate can silently diverge from what the chip actually runs at --
+# see SPEC_AUDIT_TRIAGE.md D6.
+MAX30105_SAMPLERATE_LEGAL_HR = {
+    50: {69, 118, 215, 411}, 100: {69, 118, 215, 411}, 200: {69, 118, 215, 411},
+    400: {69, 118, 215, 411}, 800: {69, 118, 215, 411}, 1000: {69, 118, 215, 411},
+    1600: {69, 118, 215}, 3200: {69},
+}
+MAX30105_SAMPLERATE_LEGAL_SPO2 = {
+    50: {69, 118, 215, 411}, 100: {69, 118, 215, 411}, 200: {69, 118, 215, 411},
+    400: {69, 118, 215, 411}, 800: {69, 118, 215}, 1000: {69, 118},
+    1600: {69}, 3200: set(),
+}
 
 
 # --- utime replacements -----------------------------------------------
@@ -219,6 +248,7 @@ class MAX30102(object):
         self._i2c = i2c
         self._active_leds = None
         self._pulse_width = None
+        self._pulse_width_us = None
         self._multi_led_read_mode = None
         # Store current config values to compute acquisition frequency
         self._sample_rate = None
@@ -232,6 +262,15 @@ class MAX30102(object):
     def setup_sensor(self, led_mode=2, adc_range=16384, sample_rate=400,
                      led_power=MAX30105_PULSE_AMP_MEDIUM, sample_avg=8,
                      pulse_width=411):
+        """Configure the sensor in one call.
+
+        Note: led_mode=3 (RED+IR+GREEN) is a MAX30105-only feature. On a
+        MAX30102 (no green LED) it desyncs check()'s FIFO decoding, since
+        each device sample is only as wide as its *active* slots (datasheet
+        p.21) but this driver always reads a fixed 9 bytes/sample in that
+        mode -- see SPEC_AUDIT_TRIAGE.md D5. set_led_mode() warns if you
+        select it.
+        """
         # Reset the sensor's registers from previous configurations
         self.soft_reset()
 
@@ -248,11 +287,18 @@ class MAX30102(object):
         # Set the ADC range to default value of 16384
         self.set_adc_range(adc_range)
 
+        # Pulse width before sample rate: the datasheet's write-time
+        # legality clamp (p.19) evaluates the requested sample rate against
+        # whatever pulse width is already in the register, so the pulse
+        # width needs to land first for that clamp to see the pair this
+        # call actually intends. This driver also validates the pair itself
+        # in set_sample_rate()/set_pulse_width(), so this ordering is now a
+        # belt-and-braces measure rather than the only protection -- see
+        # SPEC_AUDIT_TRIAGE.md D6.
+        self.set_pulse_width(pulse_width)
+
         # Set the sample rate to the default value of 400
         self.set_sample_rate(sample_rate)
-
-        # Set the Pulse Width to the default value of 411
-        self.set_pulse_width(pulse_width)
 
         # Set the LED brightness to the default value of 'low'
         self.set_pulse_amplitude_red(led_power)
@@ -361,6 +407,22 @@ class MAX30102(object):
             sleep_ms(10)
             curr_status = ord(self.i2c_read_register(MAX30105_MODE_CONFIG))
 
+        # A reset returns every register to its POR state (datasheet
+        # pag. 18), but this driver's cached copies of that config
+        # (used to decode FIFO samples and compute the acquisition
+        # frequency) would otherwise still hold the pre-reset values --
+        # stale enough to crash the next fifo_bytes_to_int() call
+        # (`3 - None`) or silently mis-scale its result. Reset the cache
+        # to the same POR values the registers now hold. No extra I2C
+        # traffic. See SPEC_AUDIT_TRIAGE.md D11.
+        self._active_leds = None
+        self._multi_led_read_mode = None
+        self._pulse_width = MAX30105_PULSE_WIDTH_69
+        self._pulse_width_us = 69
+        self._sample_rate = 50
+        self._sample_avg = 1
+        self.update_acquisition_frequency()
+
     # Power states methods
     def shutdown(self):
         # Put IC into low power mode (datasheet pg. 19)
@@ -382,6 +444,19 @@ class MAX30102(object):
         elif LED_mode == 2:
             self.set_bitmask(MAX30105_MODE_CONFIG, MAX30105_MODE_MASK, MAX30105_MODE_RED_IR_ONLY)
         elif LED_mode == 3:
+            # MAX30105-only (needs the green LED). On a MAX30102, check()
+            # still reads a fixed 9 bytes/sample here, but the device only
+            # ever puts 6 bytes/sample (2 active slots) in the FIFO for
+            # this mode, so the read pointer advances past unread samples
+            # and every following check() decodes garbage or skips data --
+            # silently. See SPEC_AUDIT_TRIAGE.md D5.
+            warnings.warn(
+                'led_mode=3 (RED+IR+GREEN) is a MAX30105-only feature; on a '
+                'MAX30102 it desyncs check()\'s FIFO decoding because the '
+                'part ID cannot tell the two apart, this driver cannot '
+                'refuse the mode outright -- only warn.',
+                stacklevel=2,
+            )
             self.set_bitmask(MAX30105_MODE_CONFIG, MAX30105_MODE_MASK, MAX30105_MODE_MULTI_LED)
         else:
             raise ValueError('Wrong LED mode:{0}!'.format(LED_mode))
@@ -403,7 +478,8 @@ class MAX30102(object):
     def set_adc_range(self, ADC_range):
         # ADC range: set the range of the conversion
         # Options: 2048, 4096, 8192, 16384
-        # Current draw: 7.81pA. 15.63pA, 31.25pA, 62.5pA per LSB.
+        # LSB size (not current draw -- Table 5, pag. 18): 7.81, 15.63,
+        # 31.25, 62.5 pA per count, respectively.
         if ADC_range == 2048:
             r = MAX30105_ADC_RANGE_2048
         elif ADC_range == 4096:
@@ -416,6 +492,32 @@ class MAX30102(object):
             raise ValueError('Wrong ADC range:{0}!'.format(ADC_range))
 
         self.set_bitmask(MAX30105_PARTICLE_CONFIG, MAX30105_ADC_RANGE_MASK, r)
+
+    def _check_rate_pulse_width_legal(self, sample_rate, pulse_width_us):
+        # Cross-check (sample_rate, pulse_width) against whichever of
+        # Table 11 (SpO2/multi-LED mode) or Table 12 (HR mode) applies to
+        # the current led_mode (datasheet pag. 23). An illegal pair isn't
+        # rejected by the chip -- it's silently clamped to some other rate
+        # at write time (pag. 19) -- so this is pure host-side validation
+        # with no I2C traffic of its own; it just runs before the writes
+        # that would otherwise trigger that silent clamp. Skipped until
+        # both values and the LED mode are known (e.g. during __init__ or
+        # before set_led_mode() has run). See SPEC_AUDIT_TRIAGE.md D6.
+        if sample_rate is None or pulse_width_us is None or self._active_leds is None:
+            return
+        legal = (
+            MAX30105_SAMPLERATE_LEGAL_HR if self._active_leds == 1
+            else MAX30105_SAMPLERATE_LEGAL_SPO2
+        )
+        if pulse_width_us not in legal.get(sample_rate, ()):
+            raise ValueError(
+                '{0} sps is not legal at a {1}us pulse width in {2} mode '
+                '(datasheet Table {3}, pag. 23)'.format(
+                    sample_rate, pulse_width_us,
+                    'HR' if self._active_leds == 1 else 'SpO2/multi-LED',
+                    12 if self._active_leds == 1 else 11,
+                )
+            )
 
     # Sample Rate Configuration
     def set_sample_rate(self, sample_rate):
@@ -444,6 +546,8 @@ class MAX30102(object):
         else:
             raise ValueError('Wrong sample rate:{0}!'.format(sample_rate))
 
+        self._check_rate_pulse_width_legal(sample_rate, self._pulse_width_us)
+
         self.set_bitmask(MAX30105_PARTICLE_CONFIG, MAX30105_SAMPLERATE_MASK, sr)
 
         # Store the sample rate and recompute the acq. freq.
@@ -465,10 +569,14 @@ class MAX30102(object):
             pw = MAX30105_PULSE_WIDTH_411
         else:
             raise ValueError('Wrong pulse width:{0}!'.format(pulse_width))
+
+        self._check_rate_pulse_width_legal(self._sample_rate, pulse_width)
+
         self.set_bitmask(MAX30105_PARTICLE_CONFIG, MAX30105_PULSE_WIDTH_MASK, pw)
 
         # Store the pulse width
         self._pulse_width = pw
+        self._pulse_width_us = pulse_width
 
     # LED Pulse Amplitude Configuration methods
     def set_active_leds_amplitude(self, amplitude):
@@ -567,23 +675,45 @@ class MAX30102(object):
         wp = self.i2c_read_register(MAX30105_FIFO_READ_PTR)
         return wp
 
+    def get_overflow_count(self):
+        """Read OVF_COUNTER (register 0x05): how many samples the device
+        has dropped because the FIFO was full since it was last cleared
+        (e.g. by clear_fifo() or setup_sensor()). Diagnostic only -- lets a
+        caller on real hardware confirm their polling loop is keeping up.
+        Whether this also increments with FIFO_ROLLOVER_EN set (this
+        driver's default) isn't specified by the datasheet -- see
+        SPEC_AUDIT_TRIAGE.md D7.
+        """
+        return ord(self.i2c_read_register(MAX30105_FIFO_OVERFLOW))
+
     # Die Temperature method: returns the temperature in C
     def read_temperature(self):
-        # DIE_TEMP_RDY interrupt must be enabled
         # Config die temperature register to take 1 temperature sample
-        self.i2c_set_register(MAX30105_DIE_TEMP_CONFIG, 0x01)
+        self.i2c_set_register(MAX30105_DIE_TEMP_CONFIG, MAX30105_TEMP_EN)
 
-        # Poll for bit to clear, reading is then complete
-        reading = ord(self.i2c_read_register(MAX30105_INT_STAT_2))
-        sleep_ms(100)
-        while (reading & MAX30105_INT_DIE_TEMP_RDY_ENABLE) > 0:
-            reading = ord(self.i2c_read_register(MAX30105_INT_STAT_2))
+        # Poll TEMP_EN itself, which self-clears when the ~29ms conversion
+        # completes (datasheet pag. 22), instead of INT_STAT_2: reading
+        # INT_STAT_2 clears its own DIE_TEMP_RDY flag as a side effect
+        # (pag. 12), so a loop that polls it by reading it destroys the
+        # condition it's waiting for and can never observe "ready" --
+        # see SPEC_AUDIT_TRIAGE.md D3. Give up after 100ms (comfortably
+        # over the conversion time) and read the result regardless,
+        # mirroring the original SparkFun implementation this driver
+        # descends from.
+        mark_time = ticks_ms()
+        while ord(self.i2c_read_register(MAX30105_DIE_TEMP_CONFIG)) & MAX30105_TEMP_EN:
+            if ticks_diff(ticks_ms(), mark_time) > 100:
+                break
             sleep_ms(1)
 
-        # Read die temperature register (integer)
+        # Read die temperature register (integer, two's complement -- see
+        # Table 10, pag. 22; e.g. 0xF6 is -10, not +246)
         tempInt = ord(self.i2c_read_register(MAX30105_DIE_TEMP_INT))
-        # Causes the clearing of the DIE_TEMP_RDY interrupt
-        tempFrac = ord(self.i2c_read_register(MAX30105_DIE_TEMP_FRAC))
+        if tempInt > 127:
+            tempInt -= 256
+        # Causes the clearing of the DIE_TEMP_RDY interrupt. TFRAC only
+        # defines its low 4 bits (pag. 22); mask off the rest.
+        tempFrac = ord(self.i2c_read_register(MAX30105_DIE_TEMP_FRAC)) & 0x0F
 
         # Calculate temperature (datasheet pg. 23)
         return float(tempInt) + (float(tempFrac) * 0.0625)
@@ -675,6 +805,17 @@ class MAX30102(object):
 
     # Get a new red value
     def get_red(self):
+        """Return the single newest RED sample, discarding any older
+        backlog, or 0 on a 250ms timeout with no new data.
+
+        NOT paired with get_ir()/get_green(): each of these three methods
+        runs its own check() and pops from its own buffer independently,
+        so two separate calls can return samples from two different
+        device readings -- and 0 is indistinguishable from "no data".
+        Anything that needs a matched RED/IR pair (e.g. SpO2) should use
+        read_sample(), or check() + pop_red_from_storage() /
+        pop_ir_from_storage(), instead. See SPEC_AUDIT_TRIAGE.md A11.
+        """
         # Check the sensor for new data for 250ms
         if self.safe_check(250):
             return self.sense.red.pop_head()
@@ -684,6 +825,8 @@ class MAX30102(object):
 
     # Get a new IR value
     def get_ir(self):
+        """Return the single newest IR sample. See get_red()'s docstring:
+        the same "not paired, 0 means either" caveats apply here."""
         # Check the sensor for new data for 250ms
         if self.safe_check(250):
             return self.sense.IR.pop_head()
@@ -693,6 +836,9 @@ class MAX30102(object):
 
     # Get a new green value
     def get_green(self):
+        """Return the single newest GREEN sample. See get_red()'s
+        docstring: the same "not paired, 0 means either" caveats apply
+        here."""
         # Check the sensor for new data for 250ms
         if self.safe_check(250):
             return self.sense.green.pop_head()
@@ -700,23 +846,45 @@ class MAX30102(object):
             # Sensor failed to find new data
             return 0
 
+    def read_sample(self):
+        """Poll for new data and return one matched (red, ir) pair, or
+        None on a 250ms timeout with no new data.
+
+        Unlike get_red()/get_ir(), which each poll and pop independently
+        and can therefore return mismatched samples (see their
+        docstrings), this runs a single check() and pops both buffers
+        together, so the two values come from the same device reading.
+        Needs led_mode=2 or higher (RED+IR). See SPEC_AUDIT_TRIAGE.md A11.
+        """
+        if self._active_leds is None or self._active_leds < 2:
+            raise ValueError(
+                'read_sample() needs led_mode=2 or higher (RED+IR); '
+                'call setup_sensor()/set_led_mode() first'
+            )
+        if not self.safe_check(250):
+            return None
+        return self.pop_red_from_storage(), self.pop_ir_from_storage()
+
     # Note: the following 3 functions are the equivalent of using 'getFIFO'
     # methods of the SparkFun library
-    # Pops the next red value in storage (if available)
+    # Pops the oldest unread red value in storage (if available). Safe to
+    # pair index-for-index with pop_ir_from_storage()/pop_green_from_storage()
+    # after a shared check() call -- see read_sample() for a convenience
+    # wrapper that does exactly that.
     def pop_red_from_storage(self):
         if len(self.sense.red) == 0:
             return 0
         else:
             return self.sense.red.pop()
 
-    # Pops the next IR value in storage (if available)
+    # Pops the oldest unread IR value in storage (if available).
     def pop_ir_from_storage(self):
         if len(self.sense.IR) == 0:
             return 0
         else:
             return self.sense.IR.pop()
 
-    # Pops the next green value in storage (if available)
+    # Pops the oldest unread green value in storage (if available).
     def pop_green_from_storage(self):
         if len(self.sense.green) == 0:
             return 0
@@ -732,7 +900,14 @@ class MAX30102(object):
 
     # Polls the sensor for new data
     def check(self):
-        # Call continuously to poll the sensor for new data.
+        # Call continuously to poll the sensor for new data. Returns the
+        # number of samples read this call (0 if none were available),
+        # which is truthy exactly when the old True/False return was, so
+        # existing `if sensor.check():` callers are unaffected -- see
+        # SPEC_AUDIT_TRIAGE.md D7. A caller that wants a backlog-size
+        # signal (a better polling-cadence indicator than
+        # get_overflow_count(), and free of extra I2C traffic) can now use
+        # the count directly.
         read_pointer = ord(self.get_read_pointer())
         write_pointer = ord(self.get_write_pointer())
 
@@ -767,10 +942,10 @@ class MAX30102(object):
                         self.fifo_bytes_to_int(fifo_bytes[6:9])
                     )
 
-            return True
+            return number_of_samples
 
         else:
-            return False
+            return 0
 
     # Check for new data but give up after a certain amount of time
     def safe_check(self, max_time_to_check):

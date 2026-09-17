@@ -14,6 +14,25 @@ more than one sample, which this port deliberately fixes. That is a buffer
 bookkeeping difference with zero I2C traffic on either side of it, so it
 cannot show up in a transaction-log diff either way; it is covered instead
 by the unit tests in test_driver.py.
+
+Two more exclusions were added for the SPEC_AUDIT_TRIAGE.md fixes, both of
+which are *deliberate* wire-protocol deviations (unlike the two above,
+these do change what's on the wire, which is exactly why they can't be
+part of a byte-identical comparison):
+
+- `read_temperature()` (D3): this port polls DIE_TEMP_CONFIG's self-clearing
+  TEMP_EN bit instead of INT_STAT_2, because reading INT_STAT_2 clears the
+  very flag the old loop was polling for. Covered by a dedicated unit test
+  in test_driver.py instead.
+- `setup_sensor()`'s internal call order (D6): this port writes pulse width
+  before sample rate (upstream, and this port before the fix, do the
+  reverse). The shared script below calls the same primitive setters upstream's
+  setup_sensor() calls, in upstream's original order, via `_run_setup()`,
+  rather than either driver's own `setup_sensor()` method, so the primitives
+  stay covered by the byte-identical comparison. The port's own
+  setup_sensor() ordering is covered by
+  test_setup_sensor_writes_pulse_width_before_sample_rate in
+  test_driver.py.
 """
 import importlib.util
 import sys
@@ -95,6 +114,30 @@ def port():
     return max30102
 
 
+def _run_setup(sensor, led_mode=2, adc_range=16384, sample_rate=400,
+               led_power=0x7F, sample_avg=8, pulse_width=411):
+    """Reproduce upstream's *original* setup_sensor() call order (sample
+    rate before pulse width) for both drivers. The port's own
+    setup_sensor() now writes pulse width first (SPEC_AUDIT_TRIAGE.md D6),
+    an intentional wire-protocol deviation excluded from this comparison --
+    see the module docstring -- so the shared script drives the same
+    primitive setters directly instead of calling either driver's
+    setup_sensor().
+    """
+    sensor.soft_reset()
+    sensor.set_fifo_average(sample_avg)
+    sensor.enable_fifo_rollover()
+    sensor.set_led_mode(led_mode)
+    sensor.set_adc_range(adc_range)
+    sensor.set_sample_rate(sample_rate)
+    sensor.set_pulse_width(pulse_width)
+    sensor.set_pulse_amplitude_red(led_power)
+    sensor.set_pulse_amplitude_ir(led_power)
+    sensor.set_pulse_amplitude_green(led_power)
+    sensor.set_pulse_amplitude_proximity(led_power)
+    sensor.clear_fifo()
+
+
 def _run_scripted_sequence(sensor, device):
     """Drive `sensor` through a fixed call sequence covering the full
     protocol surface. `device` is that sensor's own DeviceSim -- pointer/
@@ -102,9 +145,9 @@ def _run_scripted_sequence(sensor, device):
     traffic, and behave identically for both drivers since they share the
     same model.
     """
-    sensor.setup_sensor()
-    sensor.setup_sensor(
-        led_mode=3, adc_range=4096, sample_rate=100,
+    _run_setup(sensor)
+    _run_setup(
+        sensor, led_mode=3, adc_range=4096, sample_rate=100,
         led_power=0x1F, sample_avg=4, pulse_width=118,
     )
 
@@ -113,10 +156,22 @@ def _run_scripted_sequence(sensor, device):
 
     for adc_range in (2048, 4096, 8192, 16384):
         sensor.set_adc_range(adc_range)
+
+    # Pin the paired parameter to a value that's legal at every value in
+    # the loop below (datasheet Tables 11/12, pag. 23), so this port's
+    # added (sample_rate, pulse_width) cross-validation (D6) doesn't reject
+    # a combination upstream would have silently accepted and mis-clamped.
+    # 3200 sps is only ever legal at 69us, and only in HR mode, hence the
+    # mode switch -- see SPEC_AUDIT_TRIAGE.md D6.
+    sensor.set_led_mode(1)  # HR mode: every sample rate is legal at 69us
+    sensor.set_pulse_width(69)
     for sample_rate in (50, 100, 200, 400, 800, 1000, 1600, 3200):
         sensor.set_sample_rate(sample_rate)
+
+    sensor.set_sample_rate(50)  # every pulse width is legal at 50 sps
     for pulse_width in (69, 118, 215, 411):
         sensor.set_pulse_width(pulse_width)
+
     for sample_avg in (1, 2, 4, 8, 16, 32):
         sensor.set_fifo_average(sample_avg)
     for led_mode in (1, 2, 3):
@@ -157,7 +212,7 @@ def _run_scripted_sequence(sensor, device):
     sensor.get_int_1()
     sensor.get_int_2()
 
-    sensor.read_temperature()
+    # read_temperature() is excluded here -- see the module docstring (D3).
 
     sensor.wakeup()
     sensor.shutdown()
@@ -165,7 +220,7 @@ def _run_scripted_sequence(sensor, device):
 
     # Clean 2-LED configuration, then drive check() through a normal pass
     # and a FIFO wrap-boundary pass (write_ptr < read_ptr).
-    sensor.setup_sensor(led_mode=2)
+    _run_setup(sensor, led_mode=2)
 
     device.set_write_ptr(5)
     device.set_read_ptr(0)

@@ -142,9 +142,13 @@ more firmly (too light a touch lets ambient light interfere) but not hard enough
 flow (too hard flattens the pulse signal).
 
 **How it works, briefly:** `examples/heart_rate.py` defines a `HeartRateMonitor` class that
-smooths the incoming IR samples (to reduce noise), looks for local peaks above a threshold set
-from the recent min/max range, and averages the time between consecutive peaks to get BPM
-(`60000 / average_interval_ms`).
+removes each sample's slow-moving baseline (DC removal) before smoothing the incoming IR
+samples (to reduce noise), looks for local peaks above a threshold set from the recent min/max
+range, rejects any peak within 300ms of the last accepted one (a refractory period, to avoid
+double-counting a single heartbeat's dicrotic notch as two beats), and averages the time between
+consecutive accepted peaks to get BPM (`60000 / average_interval_ms`). Peaks are timestamped by
+sample index against the sensor's own acquisition rate, not wall-clock time, so the result doesn't
+depend on how promptly the host happens to poll.
 
 ---
 
@@ -172,21 +176,30 @@ def compute_spo2(red_samples, ir_samples):
     red_dc = sum(red_samples) / len(red_samples)
     ir_dc = sum(ir_samples) / len(ir_samples)
 
-    red_ac = max(red_samples) - min(red_samples)
-    ir_ac = max(ir_samples) - min(ir_samples)
+    red_ac = _percentile_spread_ac(red_samples)  # 5th-95th percentile spread
+    ir_ac = _percentile_spread_ac(ir_samples)
+    perfusion_index = ir_ac / ir_dc
+
+    if ir_dc < IR_DC_FINGER_PRESENT_MIN or perfusion_index < PERFUSION_INDEX_MIN:
+        return None, perfusion_index  # no finger, or too weak/noisy to trust
 
     r = (red_ac / red_dc) / (ir_ac / ir_dc)
 
     # Empirical curve fit (Maxim AN6409) mapping the ratio to a percentage.
-    return -45.060 * r * r + 30.354 * r + 94.845
+    return -45.060 * r * r + 30.354 * r + 94.845, perfusion_index
 ```
 
 1. **DC** (`red_dc`, `ir_dc`): the average brightness of each channel over a short window --
    roughly, how much light is getting through overall.
 2. **AC** (`red_ac`, `ir_ac`): how much each channel wobbles within that window -- the pulse.
-3. **R**: the ratio of (RED AC/DC) to (IR AC/DC). This one number is what actually correlates
+   Estimated as a percentile spread (5th-to-95th) rather than raw peak-to-peak, so one motion-spike
+   sample doesn't dominate the estimate the way a single min/max reading would.
+3. **Signal-quality gate**: if the IR channel's DC level or perfusion index (AC/DC) is too low,
+   there's no finger on the sensor (or too weak a signal to trust), so no SpO2 number is reported
+   at all rather than a confident-looking but meaningless one.
+4. **R**: the ratio of (RED AC/DC) to (IR AC/DC). This one number is what actually correlates
    with blood oxygen.
-4. A curve fit through R (values from Maxim's application note, reused across most open-source
+5. A curve fit through R (values from Maxim's application note, reused across most open-source
    MAX3010x projects) converts it to an approximate SpO2 percentage.
 
 > **Accuracy note:** real pulse oximeters are individually calibrated against a reference device
@@ -211,7 +224,7 @@ def compute_spo2(red_samples, ir_samples):
 ## Where to go next
 
 - [`README.md`](README.md) -- full API reference, install details, how this port was verified
-  against the original MicroPython driver, and the (two, non-protocol) deviations from upstream.
+  against the original MicroPython driver, and its deviations from upstream.
 - [`examples/basic_usage.py`](examples/basic_usage.py) -- MVP script with sensor detection and
   acquisition-rate reporting.
 - [`examples/heart_rate.py`](examples/heart_rate.py) -- full heart-rate example.
