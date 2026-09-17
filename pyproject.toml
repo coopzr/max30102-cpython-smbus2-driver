@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "max30102"
+version = "0.5.1"
+description = "MAX30102 pulse-oximetry / heart-rate sensor driver for CPython + smbus2 (Linux), ported from n-elia/MAX30102-MicroPython-driver"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = [
+    "smbus2>=0.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["max30102*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
