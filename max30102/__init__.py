@@ -228,6 +228,7 @@ class MAX30102(object):
                  i2c: SMBus = None,
                  bus: int = None,
                  i2c_hex_address=MAX3010X_I2C_ADDRESS,
+                 swap_red_ir=False,
                  ):
         # Exactly one of 'i2c' (an already-open smbus2.SMBus, dependency-
         # injected -- mirrors upstream's `MAX30102(i2c=SoftI2C(...))`) or
@@ -246,6 +247,14 @@ class MAX30102(object):
 
         self.i2c_address = i2c_hex_address
         self._i2c = i2c
+        # Some clone boards (e.g. the MH-ET LIVE MAX30102) have the red and
+        # IR LEDs reversed relative to the datasheet: LED1 / FIFO channel 1
+        # is physically IR and LED2 / channel 2 is physically red. With
+        # swap_red_ir=True, "red" and "IR" in this driver's API (sense.red,
+        # pop_red_from_storage(), set_pulse_amplitude_red(), ...) refer to
+        # the *physical* LEDs. Note that led_mode=1 then samples the
+        # physical IR LED (slot 1) into sense.IR.
+        self._swap_red_ir = bool(swap_red_ir)
         self._active_leds = None
         self._pulse_width = None
         self._pulse_width_us = None
@@ -588,10 +597,12 @@ class MAX30102(object):
             self.set_pulse_amplitude_green(amplitude)
 
     def set_pulse_amplitude_red(self, amplitude):
-        self.i2c_set_register(MAX30105_LED1_PULSE_AMP, amplitude)
+        reg = MAX30105_LED2_PULSE_AMP if self._swap_red_ir else MAX30105_LED1_PULSE_AMP
+        self.i2c_set_register(reg, amplitude)
 
     def set_pulse_amplitude_ir(self, amplitude):
-        self.i2c_set_register(MAX30105_LED2_PULSE_AMP, amplitude)
+        reg = MAX30105_LED1_PULSE_AMP if self._swap_red_ir else MAX30105_LED2_PULSE_AMP
+        self.i2c_set_register(reg, amplitude)
 
     def set_pulse_amplitude_green(self, amplitude):
         self.i2c_set_register(MAX30105_LED3_PULSE_AMP, amplitude)
@@ -926,16 +937,19 @@ class MAX30102(object):
                                                     self._multi_led_read_mode)
 
                 # Convert the readings from bytes to integers, depending
-                # on the number of active LEDs
+                # on the number of active LEDs. FIFO channel 1 is red and
+                # channel 2 is IR per the datasheet; swap_red_ir reverses
+                # that for boards whose LEDs are physically swapped.
+                if self._swap_red_ir:
+                    first, second = self.sense.IR, self.sense.red
+                else:
+                    first, second = self.sense.red, self.sense.IR
+
                 if self._active_leds > 0:
-                    self.sense.red.append(
-                        self.fifo_bytes_to_int(fifo_bytes[0:3])
-                    )
+                    first.append(self.fifo_bytes_to_int(fifo_bytes[0:3]))
 
                 if self._active_leds > 1:
-                    self.sense.IR.append(
-                        self.fifo_bytes_to_int(fifo_bytes[3:6])
-                    )
+                    second.append(self.fifo_bytes_to_int(fifo_bytes[3:6]))
 
                 if self._active_leds > 2:
                     self.sense.green.append(

@@ -20,6 +20,19 @@ from max30102 import MAX30102, scan
 # run `i2cdetect -y 1` to confirm.
 I2C_BUS = 1
 
+# Some clone boards (e.g. the MH-ET LIVE MAX30102) have the red and IR LEDs
+# reversed relative to the datasheet. Symptom: SpO2 stuck at 0% with a
+# clean pulse, because R comes out >> 1 (red AC/DC larger than IR AC/DC).
+# Set True for such a board; confirm by enabling one LED at a time and
+# checking with a phone camera which one is visible red.
+SWAP_RED_IR = True
+
+# Physiologically plausible range for R = (red AC/DC) / (IR AC/DC). Outside
+# it the signal is motion, a loose finger, or swapped channels, so report
+# "invalid" instead of clamping to a confident-looking 0% or 100%.
+R_MIN = 0.2
+R_MAX = 1.5
+
 # Number of samples averaged per SpO2 estimate. At the default 400Hz / 8
 # sample rate, the sensor delivers ~50 samples/second, so 100 samples is
 # about a 2-second window -- long enough to reliably span a few heartbeats.
@@ -66,7 +79,8 @@ def compute_spo2(red_samples, ir_samples):
 
     Returns (spo2, perfusion_index), or (None, perfusion_index) if the
     window doesn't look like it has a finger on it (see
-    IR_DC_FINGER_PRESENT_MIN / PERFUSION_INDEX_MIN above).
+    IR_DC_FINGER_PRESENT_MIN / PERFUSION_INDEX_MIN above) or R is outside
+    R_MIN..R_MAX.
     """
     red_dc = sum(red_samples) / len(red_samples)
     ir_dc = sum(ir_samples) / len(ir_samples)
@@ -82,6 +96,8 @@ def compute_spo2(red_samples, ir_samples):
         return None, perfusion_index
 
     r = (red_ac / red_dc) / (ir_ac / ir_dc)
+    if not (R_MIN <= r <= R_MAX):
+        return None, perfusion_index
 
     # Empirical quadratic fit from Maxim's AN6409 application note,
     # reproduced across many open-source MAX3010x projects. This is an
@@ -92,7 +108,7 @@ def compute_spo2(red_samples, ir_samples):
 
 
 def main():
-    with MAX30102(bus=I2C_BUS) as sensor:
+    with MAX30102(bus=I2C_BUS, swap_red_ir=SWAP_RED_IR) as sensor:
         # Scan the I2C bus to ensure that the sensor is connected
         if sensor.i2c_address not in scan(sensor.i2c):
             print("Sensor not found.")
@@ -133,7 +149,7 @@ def main():
                         spo2, perfusion_index * 100
                     ))
                 else:
-                    print("No finger detected / signal too weak (perfusion index {:.3f}%)".format(
+                    print("No finger / signal too weak or invalid (perfusion index {:.3f}%)".format(
                         perfusion_index * 100
                     ))
                 samples_since_compute = 0

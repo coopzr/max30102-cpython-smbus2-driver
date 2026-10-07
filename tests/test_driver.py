@@ -56,10 +56,10 @@ def test_append_evicts_oldest_past_max_size():
 # fifo_bytes_to_int
 # --------------------------------------------------------------------------
 
-def _make_sensor():
+def _make_sensor(**kwargs):
     device = DeviceSim()
     bus = FakeSMBus(device)
-    return mod.MAX30102(i2c=bus), device, bus
+    return mod.MAX30102(i2c=bus, **kwargs), device, bus
 
 
 @pytest.mark.parametrize("pulse_width,code", [(69, 0), (118, 1), (215, 2), (411, 3)])
@@ -467,3 +467,25 @@ def test_read_sample_requires_at_least_two_active_leds():
     sensor.setup_sensor(led_mode=1)
     with pytest.raises(ValueError):
         sensor.read_sample()
+
+
+# --------------------------------------------------------------------------
+# swap_red_ir (clone boards with physically reversed LEDs)
+# --------------------------------------------------------------------------
+
+def test_swap_red_ir_exchanges_fifo_channels():
+    for swap, red, ir in ((False, 0x10, 0x20), (True, 0x20, 0x10)):
+        sensor, device, _ = _make_sensor(swap_red_ir=swap)
+        sensor.setup_sensor(led_mode=2, pulse_width=411)
+        _stage_samples(device, [(0x00, 0x00, 0x10, 0x00, 0x00, 0x20)])
+        sensor.check()
+        assert sensor.pop_red_from_storage() == red
+        assert sensor.pop_ir_from_storage() == ir
+
+
+def test_swap_red_ir_swaps_led_amplitude_registers():
+    sensor, device, _ = _make_sensor(swap_red_ir=True)
+    sensor.set_pulse_amplitude_red(0x11)
+    sensor.set_pulse_amplitude_ir(0x22)
+    assert device._get(0x0D) == 0x11  # physical red is LED2
+    assert device._get(0x0C) == 0x22

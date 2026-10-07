@@ -219,6 +219,7 @@ def compute_spo2(red_samples, ir_samples):
 | `PermissionError` opening the bus | Add your user to the `i2c` group (`sudo usermod -aG i2c $USER`) and log back in, or run with `sudo`. |
 | `FileNotFoundError: [Errno 2] ... /dev/i2c-1` | I2C isn't enabled, or you're on a board where it's a different bus number -- try `bus=0` and check `ls /dev/i2c*`. |
 | Readings stuck near zero | No finger on the sensor, or it's pressed against something opaque with no skin contact. |
+| SpO2 stuck at 0% / "invalid" despite a clean pulse | Some clone boards (e.g. MH-ET LIVE) have the red and IR LEDs reversed vs. the datasheet. Pass `swap_red_ir=True` to `MAX30102(...)`. To check: enable one LED at a time (`set_pulse_amplitude_red(0)` etc.) and see which one glows visibly red -- the visible one is red; the other should show on a phone camera. |
 | Heart rate / SpO2 look noisy or don't appear | Hold still, use light-but-full finger contact, and keep the sensor away from direct sunlight or bright indoor lighting (both add noise to the readings). |
 
 ## Where to go next
