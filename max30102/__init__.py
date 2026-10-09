@@ -227,6 +227,7 @@ class MAX30102(object):
 
         self.i2c_address = i2c_hex_address
         self._i2c = i2c
+        self._closed = False
         # Some clone boards (e.g. the MH-ET LIVE MAX30102) have the red and
         # IR LEDs reversed: with swap_red_ir=True, "red" and "IR" in this
         # API refer to the physical LEDs. Note that led_mode=1 then samples
@@ -288,21 +289,30 @@ class MAX30102(object):
         self.clear_fifo()
 
     def __del__(self):
-        # Ignore errors during interpreter teardown (the bus may already
-        # be closed)
-        try:
-            self.shutdown()
-        except Exception:
-            pass
+        # Safety net for a sensor that was never closed. Ignore errors
+        # during interpreter teardown (the bus may already be closed)
         try:
             self.close()
         except Exception:
             pass
 
     def close(self):
-        # Close the bus only if it was opened by this instance (bus=<n>)
-        if self._owns_i2c:
-            self._i2c.close()
+        # Put the sensor into shutdown (LEDs off), then close the bus if it
+        # was opened by this instance (bus=<n>). Shut down first: it needs
+        # the bus. Calling close() again does nothing.
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.shutdown()
+        except OSError:
+            # The sensor isn't answering (e.g. not wired up): nothing to
+            # shut down, and an error raised inside a `with` block must not
+            # be replaced by this one
+            pass
+        finally:
+            if self._owns_i2c:
+                self._i2c.close()
 
     def __enter__(self):
         return self
@@ -408,6 +418,10 @@ class MAX30102(object):
         # Set LED mode: select which LEDs are used for sampling
         # Options: 1 = RED only (HR mode), 2 = RED + IR (SpO2 mode),
         # 3 = RED + IR + GREEN (multi-LED mode, MAX30105 only) (datasheet pag. 18)
+        if LED_mode in (1, 2, 3):
+            # The allowed (sample rate, pulse width) pairs depend on the mode
+            self._check_rate_pulse_width_legal(self._sample_rate, self._pulse_width_us, LED_mode)
+
         if LED_mode == 1:
             self.set_bitmask(MAX30105_MODE_CONFIG, MAX30105_MODE_MASK, MAX30105_MODE_RED_ONLY)
         elif LED_mode == 2:
@@ -457,15 +471,15 @@ class MAX30102(object):
 
         self.set_bitmask(MAX30105_PARTICLE_CONFIG, MAX30105_ADC_RANGE_MASK, r)
 
-    def _check_rate_pulse_width_legal(self, sample_rate, pulse_width_us):
+    def _check_rate_pulse_width_legal(self, sample_rate, pulse_width_us, active_leds):
         # Check the (sample rate, pulse width) pair against Table 11 (SpO2 /
         # multi-LED mode) or Table 12 (HR mode) of the datasheet (pag. 23),
         # since the chip silently clamps an illegal pair (pag. 19).
         # Skipped until both values and the LED mode are known.
-        if sample_rate is None or pulse_width_us is None or self._active_leds is None:
+        if sample_rate is None or pulse_width_us is None or active_leds is None:
             return
         legal = (
-            MAX30105_SAMPLERATE_LEGAL_HR if self._active_leds == 1
+            MAX30105_SAMPLERATE_LEGAL_HR if active_leds == 1
             else MAX30105_SAMPLERATE_LEGAL_SPO2
         )
         if pulse_width_us not in legal.get(sample_rate, ()):
@@ -473,9 +487,16 @@ class MAX30102(object):
                 '{0} sps is not legal at a {1}us pulse width in {2} mode '
                 '(datasheet Table {3}, pag. 23)'.format(
                     sample_rate, pulse_width_us,
-                    'HR' if self._active_leds == 1 else 'SpO2/multi-LED',
-                    12 if self._active_leds == 1 else 11,
+                    'HR' if active_leds == 1 else 'SpO2/multi-LED',
+                    12 if active_leds == 1 else 11,
                 )
+            )
+
+    def _check_led_mode_set(self, method):
+        if self._active_leds is None:
+            raise ValueError(
+                '{0} needs an LED mode; call setup_sensor()/set_led_mode() '
+                'first'.format(method)
             )
 
     # Sample Rate Configuration
@@ -508,7 +529,7 @@ class MAX30102(object):
         else:
             raise ValueError('Wrong sample rate:{0}!'.format(sample_rate))
 
-        self._check_rate_pulse_width_legal(sample_rate, self._pulse_width_us)
+        self._check_rate_pulse_width_legal(sample_rate, self._pulse_width_us, self._active_leds)
 
         self.set_bitmask(MAX30105_PARTICLE_CONFIG, MAX30105_SAMPLERATE_MASK, sr)
 
@@ -532,7 +553,7 @@ class MAX30102(object):
         else:
             raise ValueError('Wrong pulse width:{0}!'.format(pulse_width))
 
-        self._check_rate_pulse_width_legal(self._sample_rate, pulse_width)
+        self._check_rate_pulse_width_legal(self._sample_rate, pulse_width, self._active_leds)
 
         self.set_bitmask(MAX30105_PARTICLE_CONFIG, MAX30105_PULSE_WIDTH_MASK, pw)
 
@@ -542,12 +563,15 @@ class MAX30102(object):
 
     # LED Pulse Amplitude Configuration methods
     def set_active_leds_amplitude(self, amplitude):
+        # Set the LEDs the current mode pulses, by register: LED1 is not the
+        # "red" LED with swap_red_ir=True (datasheet pag. 18, Table 4)
+        self._check_led_mode_set('set_active_leds_amplitude()')
         if self._active_leds > 0:
-            self.set_pulse_amplitude_red(amplitude)
+            self.i2c_set_register(MAX30105_LED1_PULSE_AMP, amplitude)
         if self._active_leds > 1:
-            self.set_pulse_amplitude_ir(amplitude)
+            self.i2c_set_register(MAX30105_LED2_PULSE_AMP, amplitude)
         if self._active_leds > 2:
-            self.set_pulse_amplitude_green(amplitude)
+            self.i2c_set_register(MAX30105_LED3_PULSE_AMP, amplitude)
 
     def set_pulse_amplitude_red(self, amplitude):
         reg = MAX30105_LED2_PULSE_AMP if self._swap_red_ir else MAX30105_LED1_PULSE_AMP
@@ -614,6 +638,10 @@ class MAX30102(object):
         self.i2c_set_register(MAX30105_FIFO_WRITE_PTR, 0)
         self.i2c_set_register(MAX30105_FIFO_OVERFLOW, 0)
         self.i2c_set_register(MAX30105_FIFO_READ_PTR, 0)
+        # Drop the samples already read into storage too
+        self.sense.red.clear()
+        self.sense.IR.clear()
+        self.sense.green.clear()
 
     def enable_fifo_rollover(self):
         # FIFO rollover: when the FIFO is full, keep filling it with new data
@@ -626,9 +654,12 @@ class MAX30102(object):
         self.set_bitmask(MAX30105_FIFO_CONFIG, MAX30105_ROLLOVER_MASK, MAX30105_ROLLOVER_DISABLE)
 
     def set_fifo_almost_full(self, number_of_samples):
-        # Set number of samples to trigger the almost full interrupt (page 17)
-        # Power on default is 32 samples. Note it is reverse: 0x00 is
-        # 32 samples, 0x0F is 17 samples
+        # Set FIFO_A_FULL, the number of empty FIFO slots left when the
+        # almost full interrupt triggers (page 17). Note it is reverse: 0x00
+        # triggers at 32 unread samples (power on default), 0x0F at 17
+        if not 0 <= number_of_samples <= 0x0F:
+            raise ValueError(
+                'Wrong almost full value:{0}! (0 to 15 empty slots)'.format(number_of_samples))
         self.set_bitmask(MAX30105_FIFO_CONFIG, MAX30105_A_FULL_MASK, number_of_samples)
 
     def get_write_pointer(self):
@@ -752,10 +783,14 @@ class MAX30102(object):
         value = unpack(">i", b'\x00' + fifo_bytes)
         return (value[0] & 0x3FFFF) >> (3 - self._pulse_width)
 
-    # Returns how many samples are available
+    # Returns how many samples are available on every active channel (FIFO
+    # channel 1 is stored in sense.IR with swap_red_ir=True, see check())
     def available(self):
-        number_of_samples = len(self.sense.red)
-        return number_of_samples
+        if self._swap_red_ir:
+            channels = (self.sense.IR, self.sense.red, self.sense.green)
+        else:
+            channels = (self.sense.red, self.sense.IR, self.sense.green)
+        return min(len(c) for c in channels[:self._active_leds or 1])
 
     # Get a new red value
     def get_red(self):
@@ -841,6 +876,7 @@ class MAX30102(object):
     def check(self):
         # Call continuously to poll the sensor for new data.
         # Returns the number of samples read (0 if there was no new data).
+        self._check_led_mode_set('check()')
         read_pointer = ord(self.get_read_pointer())
         write_pointer = ord(self.get_write_pointer())
 

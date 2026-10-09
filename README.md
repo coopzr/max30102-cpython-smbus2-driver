@@ -82,10 +82,13 @@ Or pass an `smbus2.SMBus` instance that you manage yourself:
 from smbus2 import SMBus
 from max30102 import MAX30102
 
-with SMBus(1) as bus:
-    sensor = MAX30102(i2c=bus)
+with SMBus(1) as bus, MAX30102(i2c=bus) as sensor:
     ...
 ```
+
+Leaving the sensor's `with` block (or calling `sensor.close()`) puts the sensor into shutdown, turning its LEDs off,
+and then closes the bus if the driver opened it. A bus passed with `i2c=` is left open. Close the sensor before its
+bus: once the bus is closed, the driver can't reach the sensor to shut it down.
 
 On a Raspberry Pi, bus 1 is `/dev/i2c-1` on the 40-pin header (SDA = GPIO 2, SCL = GPIO 3).
 
@@ -153,9 +156,9 @@ sensor.set_pulse_amplitude_green(LED_POWER)  # MAX30105 only
 sensor.set_active_leds_amplitude(LED_POWER)
 ```
 
-Not every sample rate is available at every pulse width (datasheet, Tables 11 and 12). `set_sample_rate()` and
-`set_pulse_width()` raise `ValueError` for a combination that is not allowed in the current LED mode. For example, 3200
-samples/s is only available at a 69us pulse width, in LED mode 1.
+Not every sample rate is available at every pulse width (datasheet, Tables 11 and 12). `set_sample_rate()`,
+`set_pulse_width()` and `set_led_mode()` raise `ValueError` for a combination that is not allowed in the (new) LED mode.
+For example, 3200 samples/s is only available at a 69us pulse width, in LED mode 1.
 
 LED mode 3 is available only with MAX30105: `set_led_mode(3)` emits a warning, because on a MAX30102 it makes `check()`
 decode the FIFO incorrectly.

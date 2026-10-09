@@ -1,6 +1,8 @@
 """Unit tests: buffer semantics, FIFO decoding, get_red/get_ir/get_green,
-config validation, bus ownership, and scan().
+config validation, bus ownership, and scan(); plus plausible-use scenarios
+on the mock hardware.
 """
+import gc
 import struct
 import sys
 from pathlib import Path
@@ -480,3 +482,217 @@ def test_swap_red_ir_swaps_led_amplitude_registers():
     sensor.set_pulse_amplitude_ir(0x22)
     assert device._get(0x0D) == 0x11  # physical red is LED2
     assert device._get(0x0C) == 0x22
+
+
+# --------------------------------------------------------------------------
+# Plausible-use scenarios on the mock hardware: DeviceSim does only what the
+# chip can do (DeviceSim.produce() queues samples only while it is sampling)
+# and FakeSMBus fails after close() like smbus2.
+# --------------------------------------------------------------------------
+
+def _patch_smbus(monkeypatch, device):
+    """Make MAX30102(bus=<n>) open a FakeSMBus wired to `device`. Returns
+    the list of buses it opens."""
+    opened = []
+
+    def open_bus(bus_number):
+        opened.append(FakeSMBus(device))
+        return opened[-1]
+
+    monkeypatch.setattr(mod, "SMBus", open_bus)
+    return opened
+
+
+# Shutdown: leaving the sensor's `with` block turns the LEDs off
+
+def test_ctrl_c_out_of_example_loop_turns_leds_off(monkeypatch):
+    # examples/basic_usage.py: the loop runs until the user presses Ctrl+C
+    device = DeviceSim()
+    opened = _patch_smbus(monkeypatch, device)
+    with pytest.raises(KeyboardInterrupt):
+        with mod.MAX30102(bus=1) as sensor:
+            sensor.setup_sensor()
+            device.produce([(1000, 2000), (1001, 2001)])
+            sensor.check()
+            while sensor.available():
+                sensor.pop_red_from_storage()
+                sensor.pop_ir_from_storage()
+            assert device.led_current_ma(1) == 25.4
+            raise KeyboardInterrupt
+    del sensor  # the program exits
+    gc.collect()
+
+    assert opened[0]._closed
+    assert device.led_current_ma(1) == 0
+    assert device.led_current_ma(2) == 0
+
+
+def test_injected_bus_with_blocks_turn_leds_off():
+    device = DeviceSim()
+    with FakeSMBus(device) as bus, mod.MAX30102(i2c=bus) as sensor:
+        sensor.setup_sensor()
+        device.produce([(1000, 2000)])
+        sensor.check()
+    del sensor  # the program exits
+    gc.collect()
+
+    assert device.led_current_ma(1) == 0
+    assert device.led_current_ma(2) == 0
+
+
+def test_no_sensor_on_bus_exits_cleanly(monkeypatch):
+    # Wiring fault: the examples print "Sensor not found." and return
+    opened = _patch_smbus(monkeypatch, None)
+    with mod.MAX30102(bus=1) as sensor:
+        assert sensor.i2c_address not in mod.scan(sensor.i2c)
+    assert opened[0]._closed
+
+
+def test_next_run_after_close_samples_again(monkeypatch):
+    device = DeviceSim()
+    _patch_smbus(monkeypatch, device)
+    with mod.MAX30102(bus=1) as sensor:  # first run
+        sensor.setup_sensor()
+    with mod.MAX30102(bus=1) as sensor:  # next run
+        sensor.setup_sensor()
+        assert device.produce([(1000, 2000)]) == 1
+        assert sensor.read_sample() == (1000, 2000)
+
+
+def test_no_bus_traffic_after_close(monkeypatch):
+    device = DeviceSim()
+    opened = _patch_smbus(monkeypatch, device)
+    with mod.MAX30102(bus=1) as sensor:
+        sensor.setup_sensor()
+    transactions = len(opened[0].log)
+    sensor.close()
+    sensor.__del__()
+    assert len(opened[0].log) == transactions
+
+
+# available() counts every active channel
+
+def test_clone_board_hr_mode_loop_receives_samples():
+    # README "Sensor clones": swap_red_ir=True, and LED mode 1 then samples
+    # the physical IR LED
+    device = DeviceSim()
+    sensor = mod.MAX30102(i2c=FakeSMBus(device), swap_red_ir=True)
+    sensor.setup_sensor(led_mode=1)
+    device.produce([(1000,), (1001,), (1002,)])
+    sensor.check()
+
+    ir = []
+    while sensor.available():
+        ir.append(sensor.pop_ir_from_storage())
+    assert ir == [1000, 1001, 1002]
+
+
+def test_ir_only_heart_rate_loop_terminates():
+    # Heart rate only needs IR, so the user pops nothing else
+    device = DeviceSim()
+    sensor = mod.MAX30102(i2c=FakeSMBus(device))
+    sensor.setup_sensor()
+    device.produce([(1000, 2000), (1001, 2001), (1002, 2002)])
+    sensor.check()
+
+    ir = []
+    for _ in range(100):  # the user's `while sensor.available():`, capped
+        if not sensor.available():
+            break
+        ir.append(sensor.pop_ir_from_storage())
+    assert ir == [2000, 2001, 2002]
+
+
+# set_active_leds_amplitude() sets the LEDs the chip pulses
+
+def test_clone_board_hr_mode_active_led_amplitude():
+    device = DeviceSim()
+    sensor = mod.MAX30102(i2c=FakeSMBus(device), swap_red_ir=True)
+    sensor.setup_sensor(led_mode=1)  # LEDs at MEDIUM (25.4mA)
+    sensor.set_active_leds_amplitude(mod.MAX30105_PULSE_AMP_LOW)
+
+    # HR mode pulses LED1 only (datasheet Table 4)
+    assert device.led_current_ma(1) == 6.2
+    assert device.led_current_ma(2) == 0
+
+
+# set_fifo_almost_full() only touches FIFO_A_FULL
+
+def test_set_fifo_almost_full_with_a_sample_count():
+    device = DeviceSim()
+    sensor = mod.MAX30102(i2c=FakeSMBus(device))
+    sensor.setup_sensor(sample_avg=4)  # 400sps / 4 = 100Hz
+    try:
+        sensor.set_fifo_almost_full(32)  # meant as "32 samples"
+    except ValueError:
+        pass
+    # The chip must still average 4 samples, as the driver reports
+    assert device.fifo_rate_hz() == sensor.get_acquisition_frequency() == 100
+
+
+def test_set_fifo_almost_full_register_value():
+    device = DeviceSim()
+    sensor = mod.MAX30102(i2c=FakeSMBus(device))
+    sensor.setup_sensor(sample_avg=4)
+    sensor.set_fifo_almost_full(0x0F)
+    assert device.a_full_unread() == 17
+    assert device.fifo_rate_hz() == sensor.get_acquisition_frequency() == 100
+    with pytest.raises(ValueError):
+        sensor.set_fifo_almost_full(16)
+
+
+# Forgetting setup_sensor() raises a clear error
+
+def test_check_without_setup_sensor_on_fresh_chip_raises():
+    device = DeviceSim()
+    sensor = mod.MAX30102(i2c=FakeSMBus(device))  # setup_sensor() forgotten
+    assert device.produce([(1000, 2000)]) == 0  # power-on MODE 000: idle
+    with pytest.raises(ValueError, match="setup_sensor"):
+        sensor.check()
+
+
+def test_check_without_setup_sensor_after_previous_run_raises():
+    device = DeviceSim()
+    bus = FakeSMBus(device)
+    previous_run = mod.MAX30102(i2c=bus)
+    previous_run.setup_sensor()
+    device.produce([(1000, 2000)] * 3)  # left unread
+    previous_run.close()
+
+    sensor = mod.MAX30102(i2c=bus)  # setup_sensor() forgotten
+    with pytest.raises(ValueError, match="setup_sensor"):
+        sensor.check()
+
+
+def test_set_active_leds_amplitude_before_setup_sensor_raises():
+    sensor, _, _ = _make_sensor()
+    with pytest.raises(ValueError, match="setup_sensor"):
+        sensor.set_active_leds_amplitude(mod.MAX30105_PULSE_AMP_LOW)
+
+
+# set_led_mode() keeps the (sample rate, pulse width) pair legal
+
+def test_switch_hr_to_spo2_rejects_disallowed_rate():
+    device = DeviceSim()
+    sensor = mod.MAX30102(i2c=FakeSMBus(device))
+    sensor.setup_sensor(led_mode=1, sample_rate=1000, pulse_width=411)  # Table 12
+    assert device.rate_allowed()
+    try:
+        sensor.set_led_mode(2)  # Table 11: 1000sps needs <= 118us
+    except ValueError as e:
+        assert "not legal" in str(e)
+    assert device.rate_allowed()
+
+
+# setup_sensor() starts from an empty storage
+
+def test_reconfigure_discards_old_samples():
+    device = DeviceSim()
+    sensor = mod.MAX30102(i2c=FakeSMBus(device))
+    sensor.setup_sensor(pulse_width=411)
+    device.produce([(1000, 2000), (1001, 2001), (1002, 2002)])
+    assert sensor.read_sample() == (1000, 2000)
+
+    sensor.setup_sensor(pulse_width=118)
+    device.produce([(500, 600)])
+    assert sensor.read_sample() == (500, 600)

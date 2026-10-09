@@ -87,19 +87,23 @@ reporting -- is at [`examples/basic_usage.py`](examples/basic_usage.py).
 
 ### `bus=1` vs. `i2c=...`
 
-`MAX30102(bus=1)` is the easiest way to start: it opens I2C bus 1 (the Pi's default) and closes
-it for you when the `with` block ends. If you're managing the I2C connection yourself elsewhere
-in a bigger program, you can instead hand the driver an already-open bus:
+`MAX30102(bus=1)` is the easiest way to start: it opens I2C bus 1 (the Pi's default), and when
+the `with` block ends it turns the sensor's LEDs off (shutdown) and closes the bus for you. If
+you're managing the I2C connection yourself elsewhere in a bigger program, you can instead hand
+the driver an already-open bus:
 
 ```python
 from smbus2 import SMBus
 from max30102 import MAX30102
 
-with SMBus(1) as bus:
-    sensor = MAX30102(i2c=bus)
+with SMBus(1) as bus, MAX30102(i2c=bus) as sensor:
     sensor.setup_sensor()
     ...
 ```
+
+The sensor's `with` block (or `sensor.close()`) turns the LEDs off but leaves your bus open.
+Close the sensor before the bus, as above: once the bus is closed, the LEDs can't be turned off
+and stay lit after your program exits.
 
 ---
 
