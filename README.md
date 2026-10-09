@@ -99,7 +99,7 @@ default values.
 > _Led mode_: 2 (RED + IR)  
 > _ADC range_: 16384  
 > _Sample rate_: 400 Hz  
-> _Led power_: medium (25.4mA)  
+> _Led power_: maximum (50.0mA - Presence detection of ~12 inch)  
 > _Averaged samples_: 8  
 > _Pulse width_: 411
 
@@ -140,14 +140,13 @@ sensor.set_led_mode(LED_MODE)
 # Set the LED brightness of each LED
 LED_POWER = MAX30105_PULSE_AMP_MEDIUM
 # Options:
-# MAX30105_PULSE_AMP_LOWEST =  0x02 # 0.4mA
-# MAX30105_PULSE_AMP_LOW =     0x1F # 6.2mA
-# MAX30105_PULSE_AMP_MEDIUM =  0x7F # 25.4mA
-# MAX30105_PULSE_AMP_HIGH =    0xFF # 51.0mA
-# Any value from 0x00 to 0xFF works, in 0.2mA steps (datasheet, Table 8)
+# MAX30105_PULSE_AMP_LOWEST =  0x02 # 0.4mA  - Presence detection of ~4 inch
+# MAX30105_PULSE_AMP_LOW =     0x1F # 6.4mA  - Presence detection of ~8 inch
+# MAX30105_PULSE_AMP_MEDIUM =  0x7F # 25.4mA - Presence detection of ~8 inch
+# MAX30105_PULSE_AMP_HIGH =    0xFF # 50.0mA - Presence detection of ~12 inch
 sensor.set_pulse_amplitude_red(LED_POWER)
 sensor.set_pulse_amplitude_ir(LED_POWER)
-sensor.set_pulse_amplitude_green(LED_POWER)  # MAX30105 only
+sensor.set_pulse_amplitude_green(LED_POWER)
 
 # Set the LED brightness of all the active LEDs
 sensor.set_active_leds_amplitude(LED_POWER)

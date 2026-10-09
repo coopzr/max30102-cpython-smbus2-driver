@@ -93,7 +93,7 @@ class HeartRateMonitor:
 
 def main():
     with MAX30102(bus=I2C_BUS) as sensor:
-        # Scan the I2C bus to ensure that the sensor is connected
+        # Scan I2C bus to ensure that the sensor is connected
         if sensor.i2c_address not in scan(sensor.i2c):
             print("Sensor not found.")
             return

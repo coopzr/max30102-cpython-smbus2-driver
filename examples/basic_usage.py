@@ -8,16 +8,15 @@ The sensor is set up with the following parameters:
 - Sample rate: 400 Hz
 - Averaged samples: 8
 - LED brightness: medium
-- Pulse width: 411 us
+- Pulse width: 411 µs
 - Led mode: 2 (RED + IR)
 
 The temperature is read at the beginning of the acquisition.
 
 Then, in a loop the data is printed to stdout, so that it can be redirected to a file or plotted.
-Also the real acquisition frequency (i.e. the rate at which samples are collected from the sensor)
-is computed and printed. It differs from the sample rate, because the sensor processes the data
-and averages the samples before putting them into the FIFO queue (by default, 8 samples are
-averaged).
+Also the real acquisition frequency (i.e. the rate at which samples are collected from the sensor) is computed
+and printed to stdout. It differs from the sample rate, because the sensor processed the data and
+averages the samples before putting them into the FIFO queue (by default, 8 samples are averaged).
 
 Author: n-elia
 """
@@ -32,7 +31,7 @@ I2C_BUS = 1
 
 def main():
     with MAX30102(bus=I2C_BUS) as sensor:
-        # Scan the I2C bus to ensure that the sensor is connected
+        # Scan I2C bus to ensure that the sensor is connected
         if sensor.i2c_address not in scan(sensor.i2c):
             print("Sensor not found.")
             return
@@ -48,7 +47,7 @@ def main():
         # Led mode: 2 (RED + IR)
         # ADC range: 16384
         # Sample rate: 400 Hz
-        # Led power: medium (25.4mA)
+        # Led power: maximum (50.0mA - Presence detection of ~12 inch)
         # Averaged samples: 8
         # pulse width: 411
         print("Setting up sensor with default configuration.\n")
@@ -64,8 +63,8 @@ def main():
 
         time.sleep(1)
 
-        # The read_temperature() method allows to extract the die temperature in degC
-        print("Reading temperature in degC.\n")
+        # The readTemperature() method allows to extract the die temperature in °C
+        print("Reading temperature in °C.\n")
         print(sensor.read_temperature())
 
         # Select whether to compute the acquisition frequency or not
