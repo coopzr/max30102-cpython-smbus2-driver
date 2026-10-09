@@ -165,7 +165,7 @@ python examples/spo2.py
 ```
 
 Rest a fingertip gently on the sensor and hold still; it will print an estimated SpO2 percentage
-roughly every 2 seconds, and "No finger detected / signal too weak" when there's no usable
+roughly every half second, and "No finger / signal too weak or invalid" when there's no usable
 pulsatile signal.
 
 **How it works, briefly** (see [`examples/spo2.py`](examples/spo2.py) for the full code):

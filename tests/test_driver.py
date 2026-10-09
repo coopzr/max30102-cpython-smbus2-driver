@@ -399,7 +399,7 @@ def test_storage_queue_size_matches_device_fifo_depth():
 
 def test_buffer_retains_a_full_32_sample_burst():
     # Tests CircularBuffer/STORAGE_QUEUE_SIZE directly rather than via
-    # check(): the FIFO pointers are 5-bit (pag. 16), so check() can only
+    # check(): the FIFO pointers are 5-bit (pag. 13), so check() can only
     # see a 0-31 sample backlog (32 new samples looks the same as 0).
     sensor, _, _ = _make_sensor()
     for n in range(40):

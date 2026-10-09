@@ -48,7 +48,7 @@ def main():
         # Led mode: 2 (RED + IR)
         # ADC range: 16384
         # Sample rate: 400 Hz
-        # Led power: maximum (50.0mA - Presence detection of ~12 inch)
+        # Led power: medium (25.4mA)
         # Averaged samples: 8
         # pulse width: 411
         print("Setting up sensor with default configuration.\n")

@@ -2,8 +2,7 @@
 
 Can be passed as the driver's ``i2c=`` argument: it only needs
 ``i2c_rdwr`` and ``close``. Every transaction is appended to ``log`` as
-``("W", addr, bytes)`` or ``("R", addr, bytes)``, the same format as the
-``machine`` shim's ``SoftI2C`` (see test_equivalence.py).
+``("W", addr, bytes)`` or ``("R", addr, bytes)``.
 """
 from smbus2 import i2c_msg
 
