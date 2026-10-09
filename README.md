@@ -156,9 +156,9 @@ sensor.set_pulse_amplitude_green(LED_POWER)  # MAX30105 only
 sensor.set_active_leds_amplitude(LED_POWER)
 ```
 
-Not every sample rate is available at every pulse width (datasheet, Tables 11 and 12). `set_sample_rate()` and
-`set_pulse_width()` raise `ValueError` for a combination that is not allowed in the current LED mode. For example, 3200
-samples/s is only available at a 69us pulse width, in LED mode 1.
+Not every sample rate is available at every pulse width (datasheet, Tables 11 and 12). `set_sample_rate()`,
+`set_pulse_width()` and `set_led_mode()` raise `ValueError` for a combination that is not allowed in the (new) LED mode.
+For example, 3200 samples/s is only available at a 69us pulse width, in LED mode 1.
 
 LED mode 3 is available only with MAX30105: `set_led_mode(3)` emits a warning, because on a MAX30102 it makes `check()`
 decode the FIFO incorrectly.
