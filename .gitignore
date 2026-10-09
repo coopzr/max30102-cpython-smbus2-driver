@@ -1,3 +1,4 @@
 .idea
 MAX30102-MicroPython-driver
 .venv
+__pycache__/

@@ -1,11 +1,8 @@
 """ BASIC USAGE EXAMPLE
-Port of MAX30102-MicroPython-driver/examples/basic_usage/main.py for
-CPython + smbus2 on Linux.
-
 This example shows how to use the MAX30102 sensor to collect data from the RED and IR channels.
 
-The I2C bus is scanned to ensure that the sensor is connected, and the sensor is checked to
-ensure that it is a MAX30102 or MAX30105 sensor.
+The sensor is connected to the I2C bus, and the I2C bus is scanned to ensure that the sensor is connected.
+The sensor is also checked to ensure that it is a MAX30102 or MAX30105 sensor.
 
 The sensor is set up with the following parameters:
 - Sample rate: 400 Hz
@@ -22,7 +19,7 @@ is computed and printed. It differs from the sample rate, because the sensor pro
 and averages the samples before putting them into the FIFO queue (by default, 8 samples are
 averaged).
 
-Original author: n-elia
+Author: n-elia
 """
 import time
 

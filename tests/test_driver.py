@@ -1,7 +1,5 @@
-"""Unit tests for the ported driver: buffer semantics, decoding, validation,
-bus-ownership, and the parts of the API (get_red/get_ir/get_green) that are
-excluded from the upstream differential comparison because upstream's
-implementation of them is broken (see circular_buffer.py).
+"""Unit tests: buffer semantics, FIFO decoding, get_red/get_ir/get_green,
+config validation, bus ownership, and scan().
 """
 import struct
 import sys
@@ -83,8 +81,7 @@ def test_fifo_bytes_to_int_matches_manual_unpack():
 
 
 # --------------------------------------------------------------------------
-# get_red / get_ir / get_green (excluded from the upstream differential
-# comparison -- upstream's pop_head() is broken; this port fixes it)
+# get_red / get_ir / get_green
 # --------------------------------------------------------------------------
 
 def _stage_samples(device, samples):

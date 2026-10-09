@@ -1,7 +1,4 @@
 """HEART RATE EXAMPLE
-Port of MAX30102-MicroPython-driver/examples/heart_rate/main.py for
-CPython + smbus2 on Linux.
-
 A simple heart rate monitor that uses a moving window to smooth the IR signal and find peaks.
 """
 import time

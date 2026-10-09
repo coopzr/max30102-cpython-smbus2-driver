@@ -1,9 +1,7 @@
 """Shim for MicroPython's ``utime`` module, backed by real wall-clock time.
 
-Used only to run the unmodified upstream driver source under CPython for
-the differential test in test_equivalence.py. Real sleeps keep ticks_ms /
-ticks_diff meaningful without reimplementing MicroPython's wrapping tick
-counter (CPython's process lifetime never gets close to the wrap boundary).
+Used to run the MicroPython driver under CPython in test_equivalence.py.
+MicroPython's tick counter wraparound is not modelled.
 """
 import time
 

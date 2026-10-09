@@ -45,9 +45,8 @@ yourself to the `i2c` group and log out/in once: `sudo usermod -aG i2c $USER`.
 Then get the driver itself:
 
 ```bash
-git clone https://github.com/n-elia/MAX30102-MicroPython-driver   # for reference; not used directly
-# copy this project's max30102/ directory into yours, or:
-pip install .   # from this project's root, if you cloned it
+pip install .   # from this project's root
+# or copy this project's max30102/ directory into yours
 ```
 
 ---
@@ -211,8 +210,7 @@ def compute_spo2(red_samples, ir_samples):
 
 ## Where to go next
 
-- [`README.md`](README.md) -- full API reference, install details, how this port was verified
-  against the original MicroPython driver, and the (two, non-protocol) deviations from upstream.
+- [`README.md`](README.md) -- API reference and install details.
 - [`examples/basic_usage.py`](examples/basic_usage.py) -- MVP script with sensor detection and
   acquisition-rate reporting.
 - [`examples/heart_rate.py`](examples/heart_rate.py) -- full heart-rate example.

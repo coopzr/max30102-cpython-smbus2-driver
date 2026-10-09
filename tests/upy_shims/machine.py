@@ -1,18 +1,12 @@
 """Shim for MicroPython's ``machine.SoftI2C``.
 
-Used only to run the unmodified upstream driver source under CPython for
-the differential test in test_equivalence.py. Translates the
-``writeto``/``readfrom`` calls the upstream driver makes into the same
-``DeviceSim`` (tests/device_sim.py) that the ported driver's smbus2-based
-``i2c_rdwr`` calls drive, and records traffic in the same
-``("W"|"R", addr, bytes)`` log format as ``tests/fake_bus.py`` so the two
-logs can be compared directly.
+Used to run the MicroPython driver under CPython in test_equivalence.py.
+Sends ``writeto``/``readfrom`` calls to a ``DeviceSim`` (tests/device_sim.py)
+and records traffic in the same ``("W"|"R", addr, bytes)`` log format as
+``tests/fake_bus.py``.
 
-MicroPython's ``writeto``/``readfrom`` default to ``stop=True`` (a STOP is
-issued after every transaction -- no repeated start). The upstream driver
-never passes ``stop=False``, so this shim asserts that invariant: if a
-future upstream change ever did, the equivalence test would fail loudly
-instead of silently comparing apples to oranges.
+Only STOP-terminated transactions (``stop=True``, MicroPython's default)
+are modelled; anything else fails an assertion.
 """
 
 

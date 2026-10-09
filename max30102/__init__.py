@@ -1,15 +1,4 @@
-# Python (CPython + smbus2) port of:
-# https://github.com/n-elia/MAX30102-MicroPython-driver (v0.5.1, commit facf222)
-#
-# That MicroPython driver is the source of truth for this port's I2C wire
-# protocol: every register access below reproduces its exact read/write
-# shape (see i2c_read_register / i2c_set_register). Only what MicroPython's
-# standard library provides and CPython's does not -- machine.SoftI2C,
-# ustruct, utime, ucollections.deque -- has been translated. See this
-# repository's README for the full list of deviations from upstream (there
-# are two, and neither touches the wire protocol).
-#
-# Upstream is itself based on:
+# This work is a lot based on:
 # - https://github.com/sparkfun/SparkFun_MAX3010x_Sensor_Library
 #   Written by Peter Jansen and Nathan Seidle (SparkFun)
 #   This is a library written for the Maxim MAX30105 Optical Smoke Detector
@@ -23,7 +12,10 @@
 #   A port of the library to MicroPython by kandizzy
 #
 # - https://github.com/n-elia/MAX30102-MicroPython-driver
-#   The MicroPython port this driver is, in turn, ported from.       n-elia
+#   The MicroPython driver by n-elia, ported here to CPython + smbus2
+#
+# This driver aims at giving almost full access to Maxim MAX30102 functionalities.
+#                                                                          n-elia
 
 import time
 from struct import unpack
@@ -168,11 +160,7 @@ MAX_30105_EXPECTED_PART_ID = 0x15
 STORAGE_QUEUE_SIZE = 4
 
 
-# --- utime replacements -----------------------------------------------
-# CPython has no utime module. These reproduce the three utime functions
-# the driver logic depends on (ticks_ms()/ticks_diff() for the 250ms
-# safe_check() poll timeout, sleep_ms() for the reset/temperature-ready
-# polls). None of this affects I2C wire traffic.
+# Timing helpers (milliseconds)
 def sleep_ms(ms):
     time.sleep(ms / 1000)
 
@@ -201,10 +189,9 @@ class MAX30102(object):
                  i2c_hex_address=MAX3010X_I2C_ADDRESS,
                  swap_red_ir=False,
                  ):
-        # Exactly one of 'i2c' (an already-open smbus2.SMBus, dependency-
-        # injected -- mirrors upstream's `MAX30102(i2c=SoftI2C(...))`) or
-        # 'bus' (a bus number, e.g. 1; this driver opens and owns it) must
-        # be supplied.
+        # Supply exactly one of 'i2c' (an already-open smbus2.SMBus, owned
+        # by the caller) or 'bus' (an I2C bus number, e.g. 1, which the
+        # driver opens and closes itself).
         if (i2c is None) == (bus is None):
             raise ValueError(
                 "Provide exactly one of 'i2c' (an existing SMBus instance) "
@@ -219,12 +206,9 @@ class MAX30102(object):
         self.i2c_address = i2c_hex_address
         self._i2c = i2c
         # Some clone boards (e.g. the MH-ET LIVE MAX30102) have the red and
-        # IR LEDs reversed relative to the datasheet: LED1 / FIFO channel 1
-        # is physically IR and LED2 / channel 2 is physically red. With
-        # swap_red_ir=True, "red" and "IR" in this driver's API (sense.red,
-        # pop_red_from_storage(), set_pulse_amplitude_red(), ...) refer to
-        # the *physical* LEDs. Note that led_mode=1 then samples the
-        # physical IR LED (slot 1) into sense.IR.
+        # IR LEDs reversed: with swap_red_ir=True, "red" and "IR" in this
+        # API refer to the physical LEDs. Note that led_mode=1 then samples
+        # the physical IR LED (slot 1) into sense.IR.
         self._swap_red_ir = bool(swap_red_ir)
         self._active_leds = None
         self._pulse_width = None
@@ -273,11 +257,8 @@ class MAX30102(object):
         self.clear_fifo()
 
     def __del__(self):
-        # __del__ can run during interpreter teardown (or after the bus has
-        # already been closed), when I2C traffic or closing an already-
-        # closed fd may raise. Upstream has no such concern (there is no
-        # equivalent teardown ordering issue in MicroPython), so this is a
-        # CPython-specific addition, not a protocol change.
+        # Ignore errors during interpreter teardown (the bus may already
+        # be closed)
         try:
             self.shutdown()
         except Exception:
@@ -288,8 +269,7 @@ class MAX30102(object):
             pass
 
     def close(self):
-        # Only close a bus this instance opened itself (bus=<n>). A bus
-        # passed in via i2c=<SMBus> is owned by the caller.
+        # Close the bus only if it was opened by this instance (bus=<n>)
         if self._owns_i2c:
             self._i2c.close()
 
@@ -644,15 +624,9 @@ class MAX30102(object):
         self.i2c_set_register(MAX30105_MULTI_LED_CONFIG_2, 0)
 
     # Low-level I2C Communication
-    #
-    # PROTOCOL NOTE (do not "simplify" this to smbus2's read_byte_data() /
-    # read_i2c_block_data()): upstream issues a read as two independent,
-    # STOP-terminated transactions -- machine.SoftI2C.writeto()/.readfrom()
-    # default to stop=True, so there is no repeated START between the
-    # register-address write and the data read. smbus2's block-read helpers
-    # emit a single combined transaction with a repeated START instead,
-    # which is a different sequence on the wire. Two separate i2c_rdwr()
-    # calls reproduce upstream's exact two-transaction shape.
+    # A register read is two STOP-terminated transactions: write the register
+    # address, then read the data (smbus2's read_i2c_block_data() would use
+    # a repeated START instead).
     def i2c_read_register(self, REGISTER, n_bytes=1):
         self._i2c.i2c_rdwr(i2c_msg.write(self.i2c_address, bytes([REGISTER])))
         read = i2c_msg.read(self.i2c_address, n_bytes)
@@ -799,10 +773,8 @@ class MAX30102(object):
             sleep_ms(1)
 
 
-# Module-level helper equivalent to the upstream examples' `i2c.scan()`
-# call, which machine.SoftI2C provides natively and smbus2.SMBus does not.
+# Probe the bus for responding I2C addresses
 def scan(i2c: SMBus, start=0x03, end=0x77):
-    """Probe an SMBus for responding I2C addresses (like SoftI2C.scan())."""
     found = []
     for address in range(start, end + 1):
         try:
