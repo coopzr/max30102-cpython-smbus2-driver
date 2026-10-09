@@ -29,7 +29,7 @@ its functionalities. Please do not rely on it for medical purposes or profession
 ## Branches
 
 - `master` (this branch) -- the development branch, with bug fixes and additions on top of the original driver.
-- `vanilla` -- stays close to the original MicroPython driver, plus the `swap_red_ir` option.
+- `vanilla` -- a like-for-like port of the original MicroPython driver, with no fixes or additions. Untested and unsupported.
 
 ## Usage
 
