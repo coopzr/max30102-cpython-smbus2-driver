@@ -1,7 +1,4 @@
 """HEART RATE EXAMPLE
-Port of MAX30102-MicroPython-driver/examples/heart_rate/main.py for
-CPython + smbus2 on Linux.
-
 A simple heart rate monitor that uses a moving window to smooth the IR signal and find peaks.
 """
 import time
@@ -16,24 +13,17 @@ I2C_BUS = 1
 class HeartRateMonitor:
     """A simple heart rate monitor that uses a moving window to smooth the signal and find peaks.
 
-    `sample_rate` must be the sensor's actual acquisition rate (samples/sec
-    arriving in the host buffer), not a guess -- pass
-    `sensor.get_acquisition_frequency()`. It's used for two things that
-    were previously unreliable (see SPEC_AUDIT_TRIAGE.md):
+    `sample_rate` is the sensor's acquisition rate, as returned by
+    `sensor.get_acquisition_frequency()`.
 
-    - A1: peaks are timestamped by sample index (sample_count / sample_rate),
-      not wall-clock time at drain time. Samples can arrive in irregular,
-      host-scheduled bursts (e.g. anything with a sleep() in its poll
-      loop), so wall-clock time at the moment a batch happens to be
-      drained is not when the samples were actually acquired -- sample
-      index against the sensor's own rate is.
-    - A3: a slow (~1s) moving average is subtracted from each raw sample
-      before the existing short-window smoothing, so the peak threshold
-      tracks the pulsatile (AC) component instead of drifting with the
-      baseline (finger pressure settling, slow motion, ambient light).
+    - Peaks are timestamped by sample index (sample_count / sample_rate)
+      rather than wall-clock time, since samples reach the host in bursts.
+    - A slow (~1s) moving average is subtracted from each raw sample before
+      smoothing, so the peak threshold follows the pulse rather than the
+      slowly drifting baseline (finger pressure, motion, ambient light).
     """
 
-    REFRACTORY_MS = 300  # reject a peak within 200 BPM of the last one (A2)
+    REFRACTORY_MS = 300  # reject a peak within 200 BPM of the last one
 
     def __init__(self, sample_rate, window_size=10, smoothing_window=5, dc_window=None):
         self.sample_rate = sample_rate
@@ -100,12 +90,9 @@ class HeartRateMonitor:
                 and self.filtered_samples[i] > self.filtered_samples[i + 1]
             ):
                 peak_time = self.timestamps[i]
-                # Refractory period (A2): reject a local maximum too close
-                # to the last accepted peak. The classic PPG false
-                # positive is the dicrotic notch -- a second, smaller local
-                # max on the same heartbeat's downstroke -- which would
-                # otherwise double-count the beat and roughly double the
-                # reported BPM.
+                # Refractory period: reject a local maximum too close to the
+                # last accepted peak, such as the dicrotic notch (a second,
+                # smaller peak on the same heartbeat's downstroke)
                 if (
                     last_peak_time is not None
                     and peak_time - last_peak_time < self.REFRACTORY_MS
@@ -168,9 +155,7 @@ def main():
         # Set LED brightness to a medium value
         sensor.set_active_leds_amplitude(MAX30105_PULSE_AMP_MEDIUM)
 
-        # Ask the sensor for its own bookkeeping instead of recomputing
-        # sample_rate/fifo_average ourselves, so this stays correct if the
-        # configuration above changes (SPEC_AUDIT_TRIAGE.md A1).
+        # Expected acquisition rate: 400 Hz / 8 = 50 Hz
         actual_acquisition_rate = sensor.get_acquisition_frequency()
 
         time.sleep(1)

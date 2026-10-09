@@ -1,17 +1,4 @@
-# Python (CPython + smbus2) port of:
-# https://github.com/n-elia/MAX30102-MicroPython-driver (v0.5.1, commit facf222)
-#
-# That MicroPython driver was the starting point for this port's I2C wire
-# protocol: every register access below originally reproduced its exact
-# read/write shape (see i2c_read_register / i2c_set_register), and most
-# still do. A handful of accuracy/usability fixes from SPEC_AUDIT_TRIAGE.md
-# (D2/D3/D5/D6/D7/D9/D11 -- die temperature sign, the temperature-ready
-# poll, led_mode=3, sample-rate/pulse-width validation, OVF_COUNTER,
-# the host-side buffer depth, and stale config caching) now intentionally
-# diverge from upstream; each is called out at its own definition. See this
-# repository's README for the full list of deviations from upstream.
-#
-# Upstream is itself based on:
+# This work is a lot based on:
 # - https://github.com/sparkfun/SparkFun_MAX3010x_Sensor_Library
 #   Written by Peter Jansen and Nathan Seidle (SparkFun)
 #   This is a library written for the Maxim MAX30105 Optical Smoke Detector
@@ -25,7 +12,10 @@
 #   A port of the library to MicroPython by kandizzy
 #
 # - https://github.com/n-elia/MAX30102-MicroPython-driver
-#   The MicroPython port this driver is, in turn, ported from.       n-elia
+#   The MicroPython driver by n-elia, ported here to CPython + smbus2
+#
+# This driver aims at giving almost full access to Maxim MAX30102 functionalities.
+#                                                                          n-elia
 
 import time
 import warnings
@@ -170,21 +160,13 @@ SLOT_GREEN_PILOT = 0x07
 
 MAX_30105_EXPECTED_PART_ID = 0x15
 
-# Size of the queued readings. Matches the device's own 32-deep FIFO
-# (datasheet p.9) rather than upstream's MicroPython-memory-budget value of
-# 4, so a host that doesn't poll on every sample interval (e.g. any loop
-# with a sleep in it) doesn't silently drop most of what the sensor
-# collected -- see SPEC_AUDIT_TRIAGE.md D9. Pure host-side bookkeeping, no
-# I2C traffic depends on this value.
+# Size of the queued readings. Matches the 32-sample device FIFO (datasheet
+# pag. 9), so that a full FIFO read by check() is not truncated.
 STORAGE_QUEUE_SIZE = 32
 
-# Sample-rate legality per pulse width, by mode (datasheet p.23, Tables 11
-# and 12): HR mode (led_mode=1) allows more (rate, pulse width) pairs than
-# SpO2/multi-LED mode (led_mode=2/3, which share SpO2 mode's particle-
-# sensing timing). An illegal pair is silently clamped by the chip itself
-# (p.19) rather than rejected, so without this check a caller's requested
-# sample rate can silently diverge from what the chip actually runs at --
-# see SPEC_AUDIT_TRIAGE.md D6.
+# Allowed pulse widths for each sample rate (datasheet pag. 23): Table 12 for
+# HR mode (led_mode=1), Table 11 for SpO2 / multi-LED mode (led_mode=2, 3).
+# The chip silently clamps an illegal pair to another sample rate (pag. 19).
 MAX30105_SAMPLERATE_LEGAL_HR = {
     50: {69, 118, 215, 411}, 100: {69, 118, 215, 411}, 200: {69, 118, 215, 411},
     400: {69, 118, 215, 411}, 800: {69, 118, 215, 411}, 1000: {69, 118, 215, 411},
@@ -197,11 +179,7 @@ MAX30105_SAMPLERATE_LEGAL_SPO2 = {
 }
 
 
-# --- utime replacements -----------------------------------------------
-# CPython has no utime module. These reproduce the three utime functions
-# the driver logic depends on (ticks_ms()/ticks_diff() for the 250ms
-# safe_check() poll timeout, sleep_ms() for the reset/temperature-ready
-# polls). None of this affects I2C wire traffic.
+# Timing helpers (milliseconds)
 def sleep_ms(ms):
     time.sleep(ms / 1000)
 
@@ -230,10 +208,9 @@ class MAX30102(object):
                  i2c_hex_address=MAX3010X_I2C_ADDRESS,
                  swap_red_ir=False,
                  ):
-        # Exactly one of 'i2c' (an already-open smbus2.SMBus, dependency-
-        # injected -- mirrors upstream's `MAX30102(i2c=SoftI2C(...))`) or
-        # 'bus' (a bus number, e.g. 1; this driver opens and owns it) must
-        # be supplied.
+        # Supply exactly one of 'i2c' (an already-open smbus2.SMBus, owned
+        # by the caller) or 'bus' (an I2C bus number, e.g. 1, which the
+        # driver opens and closes itself).
         if (i2c is None) == (bus is None):
             raise ValueError(
                 "Provide exactly one of 'i2c' (an existing SMBus instance) "
@@ -248,12 +225,9 @@ class MAX30102(object):
         self.i2c_address = i2c_hex_address
         self._i2c = i2c
         # Some clone boards (e.g. the MH-ET LIVE MAX30102) have the red and
-        # IR LEDs reversed relative to the datasheet: LED1 / FIFO channel 1
-        # is physically IR and LED2 / channel 2 is physically red. With
-        # swap_red_ir=True, "red" and "IR" in this driver's API (sense.red,
-        # pop_red_from_storage(), set_pulse_amplitude_red(), ...) refer to
-        # the *physical* LEDs. Note that led_mode=1 then samples the
-        # physical IR LED (slot 1) into sense.IR.
+        # IR LEDs reversed: with swap_red_ir=True, "red" and "IR" in this
+        # API refer to the physical LEDs. Note that led_mode=1 then samples
+        # the physical IR LED (slot 1) into sense.IR.
         self._swap_red_ir = bool(swap_red_ir)
         self._active_leds = None
         self._pulse_width = None
@@ -273,12 +247,8 @@ class MAX30102(object):
                      pulse_width=411):
         """Configure the sensor in one call.
 
-        Note: led_mode=3 (RED+IR+GREEN) is a MAX30105-only feature. On a
-        MAX30102 (no green LED) it desyncs check()'s FIFO decoding, since
-        each device sample is only as wide as its *active* slots (datasheet
-        p.21) but this driver always reads a fixed 9 bytes/sample in that
-        mode -- see SPEC_AUDIT_TRIAGE.md D5. set_led_mode() warns if you
-        select it.
+        Note: led_mode=3 (RED + IR + GREEN) is available only with MAX30105.
+        On a MAX30102 it breaks check()'s FIFO decoding (see set_led_mode()).
         """
         # Reset the sensor's registers from previous configurations
         self.soft_reset()
@@ -296,14 +266,9 @@ class MAX30102(object):
         # Set the ADC range to default value of 16384
         self.set_adc_range(adc_range)
 
-        # Pulse width before sample rate: the datasheet's write-time
-        # legality clamp (p.19) evaluates the requested sample rate against
-        # whatever pulse width is already in the register, so the pulse
-        # width needs to land first for that clamp to see the pair this
-        # call actually intends. This driver also validates the pair itself
-        # in set_sample_rate()/set_pulse_width(), so this ordering is now a
-        # belt-and-braces measure rather than the only protection -- see
-        # SPEC_AUDIT_TRIAGE.md D6.
+        # Set the Pulse Width to the default value of 411. Set it before the
+        # sample rate: the chip checks a new sample rate against the pulse
+        # width already in the register (datasheet pag. 19)
         self.set_pulse_width(pulse_width)
 
         # Set the sample rate to the default value of 400
@@ -319,11 +284,8 @@ class MAX30102(object):
         self.clear_fifo()
 
     def __del__(self):
-        # __del__ can run during interpreter teardown (or after the bus has
-        # already been closed), when I2C traffic or closing an already-
-        # closed fd may raise. Upstream has no such concern (there is no
-        # equivalent teardown ordering issue in MicroPython), so this is a
-        # CPython-specific addition, not a protocol change.
+        # Ignore errors during interpreter teardown (the bus may already
+        # be closed)
         try:
             self.shutdown()
         except Exception:
@@ -334,8 +296,7 @@ class MAX30102(object):
             pass
 
     def close(self):
-        # Only close a bus this instance opened itself (bus=<n>). A bus
-        # passed in via i2c=<SMBus> is owned by the caller.
+        # Close the bus only if it was opened by this instance (bus=<n>)
         if self._owns_i2c:
             self._i2c.close()
 
@@ -416,14 +377,8 @@ class MAX30102(object):
             sleep_ms(10)
             curr_status = ord(self.i2c_read_register(MAX30105_MODE_CONFIG))
 
-        # A reset returns every register to its POR state (datasheet
-        # pag. 18), but this driver's cached copies of that config
-        # (used to decode FIFO samples and compute the acquisition
-        # frequency) would otherwise still hold the pre-reset values --
-        # stale enough to crash the next fifo_bytes_to_int() call
-        # (`3 - None`) or silently mis-scale its result. Reset the cache
-        # to the same POR values the registers now hold. No extra I2C
-        # traffic. See SPEC_AUDIT_TRIAGE.md D11.
+        # Reset the stored config values to the power-on-state values that
+        # the registers now hold (datasheet pag. 18)
         self._active_leds = None
         self._multi_led_read_mode = None
         self._pulse_width = MAX30105_PULSE_WIDTH_69
@@ -453,12 +408,9 @@ class MAX30102(object):
         elif LED_mode == 2:
             self.set_bitmask(MAX30105_MODE_CONFIG, MAX30105_MODE_MASK, MAX30105_MODE_RED_IR_ONLY)
         elif LED_mode == 3:
-            # MAX30105-only (needs the green LED). On a MAX30102, check()
-            # still reads a fixed 9 bytes/sample here, but the device only
-            # ever puts 6 bytes/sample (2 active slots) in the FIFO for
-            # this mode, so the read pointer advances past unread samples
-            # and every following check() decodes garbage or skips data --
-            # silently. See SPEC_AUDIT_TRIAGE.md D5.
+            # Available only with MAX30105 (green LED). On a MAX30102 the
+            # FIFO holds 6 bytes per sample in this mode (datasheet pag. 21),
+            # but check() reads 9, so the readings get out of step.
             warnings.warn(
                 'led_mode=3 (RED+IR+GREEN) is a MAX30105-only feature; on a '
                 'MAX30102 it desyncs check()\'s FIFO decoding because the '
@@ -487,8 +439,7 @@ class MAX30102(object):
     def set_adc_range(self, ADC_range):
         # ADC range: set the range of the conversion
         # Options: 2048, 4096, 8192, 16384
-        # LSB size (not current draw -- Table 5, pag. 18): 7.81, 15.63,
-        # 31.25, 62.5 pA per count, respectively.
+        # LSB size: 7.81pA, 15.63pA, 31.25pA, 62.5pA (datasheet pag. 18)
         if ADC_range == 2048:
             r = MAX30105_ADC_RANGE_2048
         elif ADC_range == 4096:
@@ -503,15 +454,10 @@ class MAX30102(object):
         self.set_bitmask(MAX30105_PARTICLE_CONFIG, MAX30105_ADC_RANGE_MASK, r)
 
     def _check_rate_pulse_width_legal(self, sample_rate, pulse_width_us):
-        # Cross-check (sample_rate, pulse_width) against whichever of
-        # Table 11 (SpO2/multi-LED mode) or Table 12 (HR mode) applies to
-        # the current led_mode (datasheet pag. 23). An illegal pair isn't
-        # rejected by the chip -- it's silently clamped to some other rate
-        # at write time (pag. 19) -- so this is pure host-side validation
-        # with no I2C traffic of its own; it just runs before the writes
-        # that would otherwise trigger that silent clamp. Skipped until
-        # both values and the LED mode are known (e.g. during __init__ or
-        # before set_led_mode() has run). See SPEC_AUDIT_TRIAGE.md D6.
+        # Check the (sample rate, pulse width) pair against Table 11 (SpO2 /
+        # multi-LED mode) or Table 12 (HR mode) of the datasheet (pag. 23),
+        # since the chip silently clamps an illegal pair (pag. 19).
+        # Skipped until both values and the LED mode are known.
         if sample_rate is None or pulse_width_us is None or self._active_leds is None:
             return
         legal = (
@@ -687,13 +633,9 @@ class MAX30102(object):
         return wp
 
     def get_overflow_count(self):
-        """Read OVF_COUNTER (register 0x05): how many samples the device
-        has dropped because the FIFO was full since it was last cleared
-        (e.g. by clear_fifo() or setup_sensor()). Diagnostic only -- lets a
-        caller on real hardware confirm their polling loop is keeping up.
-        Whether this also increments with FIFO_ROLLOVER_EN set (this
-        driver's default) isn't specified by the datasheet -- see
-        SPEC_AUDIT_TRIAGE.md D7.
+        """Read OVF_COUNTER (register 0x05): the number of samples lost
+        because the FIFO was full since it was last cleared. Useful to
+        check that the polling loop keeps up.
         """
         return ord(self.i2c_read_register(MAX30105_FIFO_OVERFLOW))
 
@@ -702,15 +644,9 @@ class MAX30102(object):
         # Config die temperature register to take 1 temperature sample
         self.i2c_set_register(MAX30105_DIE_TEMP_CONFIG, MAX30105_TEMP_EN)
 
-        # Poll TEMP_EN itself, which self-clears when the ~29ms conversion
-        # completes (datasheet pag. 22), instead of INT_STAT_2: reading
-        # INT_STAT_2 clears its own DIE_TEMP_RDY flag as a side effect
-        # (pag. 12), so a loop that polls it by reading it destroys the
-        # condition it's waiting for and can never observe "ready" --
-        # see SPEC_AUDIT_TRIAGE.md D3. Give up after 100ms (comfortably
-        # over the conversion time) and read the result regardless,
-        # mirroring the original SparkFun implementation this driver
-        # descends from.
+        # Poll for TEMP_EN to clear, reading is then complete (~29ms,
+        # datasheet pag. 22). INT_STAT_2 is not polled because reading it
+        # clears DIE_TEMP_RDY (pag. 12). Give up after 100ms.
         mark_time = ticks_ms()
         while ord(self.i2c_read_register(MAX30105_DIE_TEMP_CONFIG)) & MAX30105_TEMP_EN:
             if ticks_diff(ticks_ms(), mark_time) > 100:
@@ -774,15 +710,9 @@ class MAX30102(object):
         self.i2c_set_register(MAX30105_MULTI_LED_CONFIG_2, 0)
 
     # Low-level I2C Communication
-    #
-    # PROTOCOL NOTE (do not "simplify" this to smbus2's read_byte_data() /
-    # read_i2c_block_data()): upstream issues a read as two independent,
-    # STOP-terminated transactions -- machine.SoftI2C.writeto()/.readfrom()
-    # default to stop=True, so there is no repeated START between the
-    # register-address write and the data read. smbus2's block-read helpers
-    # emit a single combined transaction with a repeated START instead,
-    # which is a different sequence on the wire. Two separate i2c_rdwr()
-    # calls reproduce upstream's exact two-transaction shape.
+    # A register read is two STOP-terminated transactions: write the register
+    # address, then read the data (smbus2's read_i2c_block_data() would use
+    # a repeated START instead).
     def i2c_read_register(self, REGISTER, n_bytes=1):
         self._i2c.i2c_rdwr(i2c_msg.write(self.i2c_address, bytes([REGISTER])))
         read = i2c_msg.read(self.i2c_address, n_bytes)
@@ -816,16 +746,13 @@ class MAX30102(object):
 
     # Get a new red value
     def get_red(self):
-        """Return the single newest RED sample, discarding any older
-        backlog, or 0 on a 250ms timeout with no new data.
+        """Return the newest RED sample, discarding any older ones, or 0
+        if no new data arrives within 250ms.
 
-        NOT paired with get_ir()/get_green(): each of these three methods
-        runs its own check() and pops from its own buffer independently,
-        so two separate calls can return samples from two different
-        device readings -- and 0 is indistinguishable from "no data".
-        Anything that needs a matched RED/IR pair (e.g. SpO2) should use
-        read_sample(), or check() + pop_red_from_storage() /
-        pop_ir_from_storage(), instead. See SPEC_AUDIT_TRIAGE.md A11.
+        get_red(), get_ir() and get_green() each poll the sensor on their
+        own, so their results may come from different readings. For a
+        matched RED/IR pair use read_sample(), or check() followed by
+        pop_red_from_storage() / pop_ir_from_storage().
         """
         # Check the sensor for new data for 250ms
         if self.safe_check(250):
@@ -836,8 +763,7 @@ class MAX30102(object):
 
     # Get a new IR value
     def get_ir(self):
-        """Return the single newest IR sample. See get_red()'s docstring:
-        the same "not paired, 0 means either" caveats apply here."""
+        """Return the newest IR sample (see get_red())."""
         # Check the sensor for new data for 250ms
         if self.safe_check(250):
             return self.sense.IR.pop_head()
@@ -847,9 +773,7 @@ class MAX30102(object):
 
     # Get a new green value
     def get_green(self):
-        """Return the single newest GREEN sample. See get_red()'s
-        docstring: the same "not paired, 0 means either" caveats apply
-        here."""
+        """Return the newest GREEN sample (see get_red())."""
         # Check the sensor for new data for 250ms
         if self.safe_check(250):
             return self.sense.green.pop_head()
@@ -858,14 +782,9 @@ class MAX30102(object):
             return 0
 
     def read_sample(self):
-        """Poll for new data and return one matched (red, ir) pair, or
-        None on a 250ms timeout with no new data.
-
-        Unlike get_red()/get_ir(), which each poll and pop independently
-        and can therefore return mismatched samples (see their
-        docstrings), this runs a single check() and pops both buffers
-        together, so the two values come from the same device reading.
-        Needs led_mode=2 or higher (RED+IR). See SPEC_AUDIT_TRIAGE.md A11.
+        """Poll for new data and return the oldest unread (red, ir) pair,
+        taken from the same reading, or None if no new data arrives within
+        250ms. Needs led_mode=2 or higher (RED + IR).
         """
         if self._active_leds is None or self._active_leds < 2:
             raise ValueError(
@@ -878,24 +797,21 @@ class MAX30102(object):
 
     # Note: the following 3 functions are the equivalent of using 'getFIFO'
     # methods of the SparkFun library
-    # Pops the oldest unread red value in storage (if available). Safe to
-    # pair index-for-index with pop_ir_from_storage()/pop_green_from_storage()
-    # after a shared check() call -- see read_sample() for a convenience
-    # wrapper that does exactly that.
+    # Pops the next red value in storage (if available)
     def pop_red_from_storage(self):
         if len(self.sense.red) == 0:
             return 0
         else:
             return self.sense.red.pop()
 
-    # Pops the oldest unread IR value in storage (if available).
+    # Pops the next IR value in storage (if available)
     def pop_ir_from_storage(self):
         if len(self.sense.IR) == 0:
             return 0
         else:
             return self.sense.IR.pop()
 
-    # Pops the oldest unread green value in storage (if available).
+    # Pops the next green value in storage (if available)
     def pop_green_from_storage(self):
         if len(self.sense.green) == 0:
             return 0
@@ -911,14 +827,8 @@ class MAX30102(object):
 
     # Polls the sensor for new data
     def check(self):
-        # Call continuously to poll the sensor for new data. Returns the
-        # number of samples read this call (0 if none were available),
-        # which is truthy exactly when the old True/False return was, so
-        # existing `if sensor.check():` callers are unaffected -- see
-        # SPEC_AUDIT_TRIAGE.md D7. A caller that wants a backlog-size
-        # signal (a better polling-cadence indicator than
-        # get_overflow_count(), and free of extra I2C traffic) can now use
-        # the count directly.
+        # Call continuously to poll the sensor for new data.
+        # Returns the number of samples read (0 if there was no new data).
         read_pointer = ord(self.get_read_pointer())
         write_pointer = ord(self.get_write_pointer())
 
@@ -974,10 +884,8 @@ class MAX30102(object):
             sleep_ms(1)
 
 
-# Module-level helper equivalent to the upstream examples' `i2c.scan()`
-# call, which machine.SoftI2C provides natively and smbus2.SMBus does not.
+# Probe the bus for responding I2C addresses
 def scan(i2c: SMBus, start=0x03, end=0x77):
-    """Probe an SMBus for responding I2C addresses (like SoftI2C.scan())."""
     found = []
     for address in range(start, end + 1):
         try:

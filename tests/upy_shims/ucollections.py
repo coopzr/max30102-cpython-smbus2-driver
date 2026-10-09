@@ -1,19 +1,13 @@
 """Shim for MicroPython's ``ucollections.deque``.
 
-Used only to run the unmodified upstream driver source under CPython.
-Deliberately mirrors MicroPython's deque semantics rather than CPython's
+Used to run the MicroPython driver under CPython in test_equivalence.py.
+Follows MicroPython's deque semantics rather than CPython's
 ``collections.deque``:
 
 - a 3rd constructor argument (``flags``) where ``1`` means "raise
-  ``IndexError`` on append/appendleft past ``maxlen``" instead of silently
-  evicting the oldest item (CPython's ``deque(maxlen=n)`` always evicts
-  silently, which is *not* what MicroPython does and would mask the bug in
-  upstream's ``CircularBuffer.pop_head`` that this port fixes -- see
-  circular_buffer.py).
+  ``IndexError`` on append/appendleft past ``maxlen``" instead of evicting
+  the oldest item.
 - no ``clear()`` method, since MicroPython's deque does not document one.
-  ``pop_head()`` in the upstream source relies on ``clear()`` existing, so
-  reproducing its absence here is what makes the upstream bug reproduce
-  faithfully under this shim.
 """
 
 

@@ -1,7 +1,5 @@
-"""Unit tests for the ported driver: buffer semantics, decoding, validation,
-bus-ownership, and the parts of the API (get_red/get_ir/get_green) that are
-excluded from the upstream differential comparison because upstream's
-implementation of them is broken (see circular_buffer.py).
+"""Unit tests: buffer semantics, FIFO decoding, get_red/get_ir/get_green,
+config validation, bus ownership, and scan().
 """
 import struct
 import sys
@@ -83,8 +81,7 @@ def test_fifo_bytes_to_int_matches_manual_unpack():
 
 
 # --------------------------------------------------------------------------
-# get_red / get_ir / get_green (excluded from the upstream differential
-# comparison -- upstream's pop_head() is broken; this port fixes it)
+# get_red / get_ir / get_green
 # --------------------------------------------------------------------------
 
 def _stage_samples(device, samples):
@@ -266,9 +263,8 @@ def test_scan_finds_device_and_skips_others():
 
 
 # --------------------------------------------------------------------------
-# SPEC_AUDIT_TRIAGE.md D2/D3 -- read_temperature(): signed TINT, masked
-# TFRAC, and the TEMP_EN poll (DeviceSim self-clears it instantly, so this
-# always takes the fast path -- see device_sim.py).
+# read_temperature(): signed TINT, masked TFRAC, and the TEMP_EN poll
+# (DeviceSim clears TEMP_EN instantly -- see device_sim.py)
 # --------------------------------------------------------------------------
 
 def test_read_temperature_decodes_negative_integer_part():
@@ -290,7 +286,7 @@ def test_read_temperature_positive_integer_part_unaffected():
 
 
 # --------------------------------------------------------------------------
-# SPEC_AUDIT_TRIAGE.md D5 -- led_mode=3 warns (MAX30105-only feature)
+# led_mode=3 warns (MAX30105-only feature)
 # --------------------------------------------------------------------------
 
 def test_led_mode_3_warns():
@@ -307,8 +303,8 @@ def test_led_mode_1_and_2_do_not_warn(recwarn):
 
 
 # --------------------------------------------------------------------------
-# SPEC_AUDIT_TRIAGE.md D6 -- (sample_rate, pulse_width) legality per mode,
-# and setup_sensor()'s pulse-width-before-sample-rate write order.
+# (sample_rate, pulse_width) legality per mode, and setup_sensor()'s
+# pulse-width-before-sample-rate write order
 # --------------------------------------------------------------------------
 
 def test_setup_sensor_writes_pulse_width_before_sample_rate():
@@ -365,7 +361,7 @@ def test_rate_pulse_width_check_skipped_before_led_mode_is_known():
 
 
 # --------------------------------------------------------------------------
-# SPEC_AUDIT_TRIAGE.md D7 -- OVF_COUNTER accessor, check() returns a count
+# OVF_COUNTER accessor, check() returns a count
 # --------------------------------------------------------------------------
 
 def test_get_overflow_count_reads_register():
@@ -394,8 +390,7 @@ def test_check_returns_zero_falsy_when_no_new_data():
 
 
 # --------------------------------------------------------------------------
-# SPEC_AUDIT_TRIAGE.md D9 -- host-side buffer matches the device's 32-deep
-# FIFO instead of upstream's MicroPython-memory-budget value of 4.
+# Host-side buffer holds as many samples as the 32-sample device FIFO
 # --------------------------------------------------------------------------
 
 def test_storage_queue_size_matches_device_fifo_depth():
@@ -403,13 +398,9 @@ def test_storage_queue_size_matches_device_fifo_depth():
 
 
 def test_buffer_retains_a_full_32_sample_burst():
-    # Exercises CircularBuffer/STORAGE_QUEUE_SIZE directly rather than via
-    # check(): the device's own FIFO write/read pointers are 5-bit (pag.
-    # 16), so a single check() call can only ever observe a 0-31 sample
-    # backlog, never a full 32 -- 32 new samples is indistinguishable from
-    # 0 by pointer difference alone (see SPEC_AUDIT_TRIAGE.md D8). That
-    # device-side ambiguity is orthogonal to what this test is checking:
-    # that the host-side buffer itself doesn't start evicting before 32.
+    # Tests CircularBuffer/STORAGE_QUEUE_SIZE directly rather than via
+    # check(): the FIFO pointers are 5-bit (pag. 16), so check() can only
+    # see a 0-31 sample backlog (32 new samples looks the same as 0).
     sensor, _, _ = _make_sensor()
     for n in range(40):
         sensor.sense.red.append(n)
@@ -418,8 +409,8 @@ def test_buffer_retains_a_full_32_sample_burst():
 
 
 # --------------------------------------------------------------------------
-# SPEC_AUDIT_TRIAGE.md D11 -- soft_reset() resets cached config fields to
-# their POR equivalents instead of leaving them stale.
+# soft_reset() resets the stored config values to their power-on-state
+# values
 # --------------------------------------------------------------------------
 
 def test_soft_reset_resets_cached_config_to_por_defaults():
@@ -439,12 +430,12 @@ def test_soft_reset_resets_cached_config_to_por_defaults():
 def test_fifo_bytes_to_int_does_not_crash_right_after_soft_reset():
     sensor, _, _ = _make_sensor()
     sensor.soft_reset()
-    # Would previously raise TypeError (`3 - None`) on the stale cache.
+    # Must not raise (e.g. TypeError from `3 - None`).
     sensor.fifo_bytes_to_int(b"\xFF\xFF\xFF")
 
 
 # --------------------------------------------------------------------------
-# SPEC_AUDIT_TRIAGE.md A11 -- read_sample() returns a matched (red, ir) pair
+# read_sample() returns a matched (red, ir) pair
 # --------------------------------------------------------------------------
 
 def test_read_sample_returns_matched_pair():

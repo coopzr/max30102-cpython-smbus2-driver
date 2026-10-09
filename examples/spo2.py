@@ -38,34 +38,24 @@ R_MAX = 1.5
 # about a 2-second window -- long enough to reliably span a few heartbeats.
 WINDOW_SIZE = 100
 
-# Recompute every N new samples instead of on every single one, so the
-# window actually slides instead of being thrown away and refilled from
-# scratch each time (SPEC_AUDIT_TRIAGE.md A10). ~0.5s at the defaults.
+# Recompute the estimate every N new samples (~0.5s at the defaults).
 RECOMPUTE_EVERY = 25
 
-# Signal-quality gate (SPEC_AUDIT_TRIAGE.md A9): without a floor on both
-# the IR DC level and the perfusion index, an empty sensor still prints a
-# confident-looking, meaningless SpO2 percentage. Both thresholds are
-# rough starting points (the SparkFun examples this port descends from use
-# ~50000 counts as their "finger present" DC floor) and need tuning
-# against real hardware -- unverifiable without a sensor.
+# Signal-quality gate: below these IR DC and perfusion index levels there is
+# no finger on the sensor (or the signal is too weak), so no SpO2 is
+# reported. Both are rough starting points (the SparkFun examples use
+# ~50000 counts as their "finger present" level); tune them for your sensor.
 IR_DC_FINGER_PRESENT_MIN = 50000  # ADC counts
 PERFUSION_INDEX_MIN = 0.002  # 0.2%
 
 
 def _percentile_spread_ac(samples):
     """Estimate the AC (pulsatile) amplitude as the 5th-to-95th percentile
-    spread of the window, instead of the full peak-to-peak (max - min)
-    swing this replaced.
+    spread of the window.
 
-    A single motion-spike outlier becomes the new min or max and sets the
-    peak-to-peak swing for the *entire* window; a percentile spread
-    instead drops the top/bottom ~5% of samples (a spike among 100 samples
-    lands within that dropped 5%), so one bad sample doesn't dominate the
-    estimate the way max-min does. An RMS estimate was considered too
-    (also in SPEC_AUDIT_TRIAGE.md A5) but rejected: because RMS sums
-    squared deviations, one sufficiently large spike still dominates it,
-    just less severely than max-min.
+    Unlike peak-to-peak (max - min), this ignores the top and bottom ~5% of
+    samples, so a single motion spike doesn't set the amplitude for the
+    whole window.
     """
     ordered = sorted(samples)
     n = len(ordered)
@@ -137,11 +127,8 @@ def main():
                 ir_window.append(sensor.pop_ir_from_storage())
                 samples_since_compute += 1
 
-            # The deques themselves already slide (maxlen evicts the
-            # oldest sample as new ones arrive) -- recompute periodically
-            # instead of on every single new sample, rather than clearing
-            # and refilling from scratch each time (SPEC_AUDIT_TRIAGE.md
-            # A10).
+            # The window slides (maxlen evicts the oldest samples);
+            # recompute every RECOMPUTE_EVERY new samples
             if len(red_window) == WINDOW_SIZE and samples_since_compute >= RECOMPUTE_EVERY:
                 spo2, perfusion_index = compute_spo2(list(red_window), list(ir_window))
                 if spo2 is not None:

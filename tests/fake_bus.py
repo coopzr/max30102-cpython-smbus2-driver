@@ -1,11 +1,9 @@
 """A fake smbus2-shaped bus that drives a DeviceSim and records traffic.
 
-Shaped enough like :class:`smbus2.SMBus` to be a drop-in for the ported
-driver's ``i2c=`` constructor argument: it only needs ``i2c_rdwr`` and
-``close``. Every transaction is appended to ``log`` as
-``("W", addr, bytes)`` or ``("R", addr, bytes)``, which is exactly the
-format the ``machine`` shim's fake ``SoftI2C`` uses too -- so the two logs
-can be compared directly in test_equivalence.py.
+Can be passed as the driver's ``i2c=`` argument: it only needs
+``i2c_rdwr`` and ``close``. Every transaction is appended to ``log`` as
+``("W", addr, bytes)`` or ``("R", addr, bytes)``, the same format as the
+``machine`` shim's ``SoftI2C`` (see test_equivalence.py).
 """
 from smbus2 import i2c_msg
 

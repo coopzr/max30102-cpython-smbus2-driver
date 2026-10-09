@@ -1,13 +1,9 @@
 """A tiny deterministic model of the MAX30102 register file + FIFO.
 
-This is not a datasheet-accurate simulation of the physical sensor -- it
-exists purely to give the ported driver and the unmodified upstream
-MicroPython driver something to talk to, so their I2C transaction logs can
-be compared byte-for-byte (see test_equivalence.py). Because both drivers
-drive their own fresh instance of this exact same deterministic model, any
-starting register values we pick are fine: what matters is that the same
-starting state produces the same read-modify-write arithmetic in both
-drivers, not that the values match real silicon.
+This is not a datasheet-accurate simulation of the physical sensor: it
+gives the drivers under test something to talk to, so their I2C traffic can
+be checked (see test_equivalence.py). Starting register values don't need
+to match real silicon, only to be the same for every instance.
 
 Addressing mirrors the real device: a 1-byte write sets the "current
 register" pointer, a 2-byte write sets the pointer *and* writes a value to
@@ -53,7 +49,7 @@ _FIXED_REGISTERS = {
 # Fixed "measurement" the simulated die-temperature conversion reports.
 # 25 + 8 * 0.0625 = 25.5 degC. INT_STAT_2's DIE_TEMP_RDY bit (0x02) is never
 # set by this model, so read_temperature()'s ready-poll loop always exits
-# after exactly one read -- for both drivers, identically.
+# after exactly one read.
 _SIMULATED_DIE_TEMP_INT = 25
 _SIMULATED_DIE_TEMP_FRAC = 8
 
@@ -100,11 +96,9 @@ class DeviceSim:
                 value &= ~RESET_BIT & 0xFF
             elif reg == REG_DIE_TEMP_CONFIG and (value & TEMP_EN_BIT):
                 # Datasheet: TEMP_EN self-clears once the temperature
-                # conversion completes. Modeled as completing instantly,
-                # same rationale as RESET above -- this also means
-                # read_temperature()'s new TEMP_EN poll (see
-                # SPEC_AUDIT_TRIAGE.md D3) exits on its first check rather
-                # than running out its 100ms timeout in every test.
+                # conversion completes. Simulated as completing instantly,
+                # like RESET above, so read_temperature()'s TEMP_EN poll
+                # exits on its first check.
                 value &= ~TEMP_EN_BIT & 0xFF
             self._set(reg, value)
         else:

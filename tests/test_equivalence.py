@@ -1,38 +1,18 @@
-"""Differential test: the port vs. the unmodified upstream MicroPython source.
+"""I2C traffic comparison against the reference MicroPython driver.
 
-Both the ported driver (max30102/__init__.py, talking smbus2) and the
-unmodified upstream driver (loaded straight from the sibling
-MAX30102-MicroPython-driver clone, talking through a machine.SoftI2C shim)
-are driven through an identical scripted sequence of calls against their
-own freshly-seeded DeviceSim. If the port is protocol-faithful, the two
-resulting I2C transaction logs -- every byte, in order -- must be equal.
+This driver and n-elia's MicroPython driver (loaded from a
+MAX30102-MicroPython-driver clone, through a machine.SoftI2C shim) are run
+through the same sequence of calls, each against its own DeviceSim. The two
+I2C transaction logs must be byte-for-byte identical.
 
-get_red()/get_ir()/get_green() are intentionally excluded from the shared
-script: upstream's CircularBuffer.pop_head() is broken (see
-max30102/circular_buffer.py's docstring) and raises for any buffer holding
-more than one sample, which this port deliberately fixes. That is a buffer
-bookkeeping difference with zero I2C traffic on either side of it, so it
-cannot show up in a transaction-log diff either way; it is covered instead
-by the unit tests in test_driver.py.
+Not part of the sequence, because the two drivers intentionally differ
+there (each is covered by test_driver.py instead):
 
-Two more exclusions were added for the SPEC_AUDIT_TRIAGE.md fixes, both of
-which are *deliberate* wire-protocol deviations (unlike the two above,
-these do change what's on the wire, which is exactly why they can't be
-part of a byte-identical comparison):
-
-- `read_temperature()` (D3): this port polls DIE_TEMP_CONFIG's self-clearing
-  TEMP_EN bit instead of INT_STAT_2, because reading INT_STAT_2 clears the
-  very flag the old loop was polling for. Covered by a dedicated unit test
-  in test_driver.py instead.
-- `setup_sensor()`'s internal call order (D6): this port writes pulse width
-  before sample rate (upstream, and this port before the fix, do the
-  reverse). The shared script below calls the same primitive setters upstream's
-  setup_sensor() calls, in upstream's original order, via `_run_setup()`,
-  rather than either driver's own `setup_sensor()` method, so the primitives
-  stay covered by the byte-identical comparison. The port's own
-  setup_sensor() ordering is covered by
-  test_setup_sensor_writes_pulse_width_before_sample_rate in
-  test_driver.py.
+- get_red()/get_ir()/get_green().
+- read_temperature(): this driver polls DIE_TEMP_CONFIG's self-clearing
+  TEMP_EN bit instead of INT_STAT_2.
+- setup_sensor(): this driver writes pulse width before sample rate. The
+  sequence calls the individual setters through _run_setup() instead.
 """
 import importlib.util
 import sys
@@ -44,19 +24,19 @@ sys.path.insert(0, str(Path(__file__).parent))
 from device_sim import DeviceSim  # noqa: E402
 from fake_bus import FakeSMBus  # noqa: E402
 
-UPSTREAM_CLONE = Path(__file__).parent.parent / "MAX30102-MicroPython-driver"
-UPSTREAM_PKG_INIT = UPSTREAM_CLONE / "max30102" / "__init__.py"
+REFERENCE_CLONE = Path(__file__).parent.parent / "MAX30102-MicroPython-driver"
+REFERENCE_PKG_INIT = REFERENCE_CLONE / "max30102" / "__init__.py"
 SHIMS_DIR = Path(__file__).parent / "upy_shims"
 
 pytestmark = pytest.mark.skipif(
-    not UPSTREAM_PKG_INIT.exists(),
-    reason="sibling MAX30102-MicroPython-driver clone not found next to this project",
+    not REFERENCE_PKG_INIT.exists(),
+    reason="MAX30102-MicroPython-driver clone not found in the project root",
 )
 
 
 def _install_shims():
-    """Install the upy_shims/*.py modules into sys.modules under the exact
-    names upstream's source imports (machine, ustruct, utime, ucollections).
+    """Install the upy_shims/*.py modules into sys.modules as machine,
+    ustruct, utime and ucollections.
     """
     for name in ("ustruct", "utime", "ucollections", "machine"):
         if name in sys.modules:
@@ -67,18 +47,13 @@ def _install_shims():
         spec.loader.exec_module(module)
 
 
-def _load_upstream_module():
-    """Load the unmodified upstream max30102 package from source.
+def _load_reference_module():
+    """Load the MicroPython driver's max30102 package from source.
 
-    Upstream's own __init__.py does `from max30102.circular_buffer import
-    CircularBuffer` -- an absolute import of a package literally named
-    "max30102". To make that resolve to upstream's own circular_buffer.py
-    (not this project's ported one), the real "max30102" name in
-    sys.modules is temporarily freed, upstream is loaded under that name,
-    and then immediately detached to its own name so the ported package can
-    occupy "max30102" afterward. This works because, once module execution
-    has completed, the classes defined inside no longer depend on their
-    name staying in sys.modules.
+    Both packages are named "max30102", and the MicroPython driver imports
+    `max30102.circular_buffer`. So this project's package is temporarily
+    removed from sys.modules, the MicroPython package is loaded under that
+    name, and then this project's package is put back.
     """
     _install_shims()
 
@@ -90,8 +65,8 @@ def _load_upstream_module():
         del sys.modules[k]
     try:
         spec = importlib.util.spec_from_file_location(
-            "max30102", UPSTREAM_PKG_INIT,
-            submodule_search_locations=[str(UPSTREAM_PKG_INIT.parent)],
+            "max30102", REFERENCE_PKG_INIT,
+            submodule_search_locations=[str(REFERENCE_PKG_INIT.parent)],
         )
         module = importlib.util.module_from_spec(spec)
         sys.modules["max30102"] = module
@@ -104,25 +79,20 @@ def _load_upstream_module():
 
 
 @pytest.fixture(scope="module")
-def upstream():
-    return _load_upstream_module()
+def reference():
+    return _load_reference_module()
 
 
 @pytest.fixture()
-def port():
+def driver():
     import max30102
     return max30102
 
 
 def _run_setup(sensor, led_mode=2, adc_range=16384, sample_rate=400,
                led_power=0x7F, sample_avg=8, pulse_width=411):
-    """Reproduce upstream's *original* setup_sensor() call order (sample
-    rate before pulse width) for both drivers. The port's own
-    setup_sensor() now writes pulse width first (SPEC_AUDIT_TRIAGE.md D6),
-    an intentional wire-protocol deviation excluded from this comparison --
-    see the module docstring -- so the shared script drives the same
-    primitive setters directly instead of calling either driver's
-    setup_sensor().
+    """Call the setters setup_sensor() uses, in the MicroPython driver's
+    order (sample rate before pulse width). See the module docstring.
     """
     sensor.soft_reset()
     sensor.set_fifo_average(sample_avg)
@@ -139,11 +109,9 @@ def _run_setup(sensor, led_mode=2, adc_range=16384, sample_rate=400,
 
 
 def _run_scripted_sequence(sensor, device):
-    """Drive `sensor` through a fixed call sequence covering the full
-    protocol surface. `device` is that sensor's own DeviceSim -- pointer/
-    FIFO staging calls on it are direct register-file pokes, not I2C
-    traffic, and behave identically for both drivers since they share the
-    same model.
+    """Drive `sensor` through a fixed call sequence covering every register
+    access. `device` is that sensor's own DeviceSim; staging pointers and
+    FIFO bytes on it does not generate I2C traffic.
     """
     _run_setup(sensor)
     _run_setup(
@@ -157,12 +125,9 @@ def _run_scripted_sequence(sensor, device):
     for adc_range in (2048, 4096, 8192, 16384):
         sensor.set_adc_range(adc_range)
 
-    # Pin the paired parameter to a value that's legal at every value in
-    # the loop below (datasheet Tables 11/12, pag. 23), so this port's
-    # added (sample_rate, pulse_width) cross-validation (D6) doesn't reject
-    # a combination upstream would have silently accepted and mis-clamped.
-    # 3200 sps is only ever legal at 69us, and only in HR mode, hence the
-    # mode switch -- see SPEC_AUDIT_TRIAGE.md D6.
+    # Keep every (sample rate, pulse width) pair legal (datasheet Tables
+    # 11/12, pag. 23), since this driver rejects illegal pairs. 3200 sps is
+    # only legal at 69us in HR mode.
     sensor.set_led_mode(1)  # HR mode: every sample rate is legal at 69us
     sensor.set_pulse_width(69)
     for sample_rate in (50, 100, 200, 400, 800, 1000, 1600, 3200):
@@ -212,7 +177,7 @@ def _run_scripted_sequence(sensor, device):
     sensor.get_int_1()
     sensor.get_int_2()
 
-    # read_temperature() is excluded here -- see the module docstring (D3).
+    # read_temperature() is not compared -- see the module docstring.
 
     sensor.wakeup()
     sensor.shutdown()
@@ -237,16 +202,16 @@ def _run_scripted_sequence(sensor, device):
     sensor.pop_ir_from_storage()
 
 
-def test_transaction_logs_are_byte_identical(upstream, port):
-    upstream_device = DeviceSim()
-    upstream_bus = sys.modules["machine"].SoftI2C(device=upstream_device)
-    upstream_sensor = upstream.MAX30102(i2c=upstream_bus)
+def test_transaction_logs_are_byte_identical(reference, driver):
+    reference_device = DeviceSim()
+    reference_bus = sys.modules["machine"].SoftI2C(device=reference_device)
+    reference_sensor = reference.MAX30102(i2c=reference_bus)
 
-    port_device = DeviceSim()
-    port_bus = FakeSMBus(port_device)
-    port_sensor = port.MAX30102(i2c=port_bus)
+    device = DeviceSim()
+    bus = FakeSMBus(device)
+    sensor = driver.MAX30102(i2c=bus)
 
-    _run_scripted_sequence(upstream_sensor, upstream_device)
-    _run_scripted_sequence(port_sensor, port_device)
+    _run_scripted_sequence(reference_sensor, reference_device)
+    _run_scripted_sequence(sensor, device)
 
-    assert port_bus.log == upstream_bus.log
+    assert bus.log == reference_bus.log

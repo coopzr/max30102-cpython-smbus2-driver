@@ -5,8 +5,7 @@ on Windows. We only need the real, ctypes-based ``i2c_msg`` class and the
 ``SMBus`` class shape for type-checking in tests -- the fake bus below never
 reaches an actual ioctl call -- so we install a minimal stub ``fcntl`` module
 into ``sys.modules`` before ``smbus2`` (or anything that imports it) is
-imported for the first time. This is test-only scaffolding; on Linux the
-real ``fcntl`` module is used and this stub is never installed.
+imported for the first time. On Linux the real ``fcntl`` module is used.
 """
 import sys
 import types
