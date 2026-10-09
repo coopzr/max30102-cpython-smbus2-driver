@@ -1,13 +1,36 @@
-"""HEART RATE EXAMPLE
-A simple heart rate monitor that uses a moving window to smooth the IR signal and find peaks.
-"""
 import time
 
-from max30102 import MAX30102, MAX30105_PULSE_AMP_MEDIUM, scan
+from smbus2 import SMBus, i2c_msg
+
+from max30102 import MAX30102, MAX30105_PULSE_AMP_MEDIUM
 
 # I2C bus number. On a Raspberry Pi, bus 1 is the usual /dev/i2c-1 header;
 # run `i2cdetect -y 1` to confirm.
 I2C_BUS = 1
+
+
+def ticks_us():
+    return time.monotonic_ns() // 1000
+
+
+def ticks_ms():
+    return time.monotonic_ns() // 1000000
+
+
+def ticks_diff(a, b):
+    return a - b
+
+
+# Probe the bus for responding I2C addresses (smbus2 has no scan())
+def scan(i2c):
+    found = []
+    for address in range(0x03, 0x78):
+        try:
+            i2c.i2c_rdwr(i2c_msg.write(address, b""))
+        except OSError:
+            continue
+        found.append(address)
+    return found
 
 
 class HeartRateMonitor:
@@ -23,14 +46,14 @@ class HeartRateMonitor:
 
     def add_sample(self, sample):
         """Add a new sample to the monitor."""
-        timestamp = time.monotonic_ns() // 1_000_000
+        timestamp = ticks_ms()
         self.samples.append(sample)
         self.timestamps.append(timestamp)
 
         # Apply smoothing
         if len(self.samples) >= self.smoothing_window:
             smoothed_sample = (
-                sum(self.samples[-self.smoothing_window:]) / self.smoothing_window
+                sum(self.samples[-self.smoothing_window :]) / self.smoothing_window
             )
             self.filtered_samples.append(smoothed_sample)
         else:
@@ -50,7 +73,7 @@ class HeartRateMonitor:
             return peaks
 
         # Calculate dynamic threshold based on the min and max of the recent window of filtered samples
-        recent_samples = self.filtered_samples[-self.window_size:]
+        recent_samples = self.filtered_samples[-self.window_size :]
         min_val = min(recent_samples)
         max_val = max(recent_samples)
         threshold = (
@@ -78,7 +101,7 @@ class HeartRateMonitor:
         # Calculate the average interval between peaks in milliseconds
         intervals = []
         for i in range(1, len(peaks)):
-            interval = peaks[i][0] - peaks[i - 1][0]
+            interval = ticks_diff(peaks[i][0], peaks[i - 1][0])
             intervals.append(interval)
 
         average_interval = sum(intervals) / len(intervals)
@@ -92,84 +115,89 @@ class HeartRateMonitor:
 
 
 def main():
-    with MAX30102(bus=I2C_BUS) as sensor:
-        # Scan I2C bus to ensure that the sensor is connected
-        if sensor.i2c_address not in scan(sensor.i2c):
-            print("Sensor not found.")
-            return
-        elif not sensor.check_part_id():
-            # Check that the targeted sensor is compatible
-            print("I2C device ID not corresponding to MAX30102 or MAX30105.")
-            return
-        else:
-            print("Sensor connected and recognized.")
+    # I2C bus instance
+    i2c = SMBus(I2C_BUS)
 
-        # Load the default configuration
-        print("Setting up sensor with default configuration.\n")
-        sensor.setup_sensor()
+    # Sensor instance
+    sensor = MAX30102(i2c=i2c)  # An I2C instance is required
 
-        # Set the sample rate to 400: 400 samples/s are collected by the sensor
-        sensor_sample_rate = 400
-        sensor.set_sample_rate(sensor_sample_rate)
+    # Scan I2C bus to ensure that the sensor is connected
+    if sensor.i2c_address not in scan(i2c):
+        print("Sensor not found.")
+        return
+    elif not (sensor.check_part_id()):
+        # Check that the targeted sensor is compatible
+        print("I2C device ID not corresponding to MAX30102 or MAX30105.")
+        return
+    else:
+        print("Sensor connected and recognized.")
 
-        # Set the number of samples to be averaged per each reading
-        sensor_fifo_average = 8
-        sensor.set_fifo_average(sensor_fifo_average)
+    # Load the default configuration
+    print("Setting up sensor with default configuration.", "\n")
+    sensor.setup_sensor()
 
-        # Set LED brightness to a medium value
-        sensor.set_active_leds_amplitude(MAX30105_PULSE_AMP_MEDIUM)
+    # Set the sample rate to 400: 400 samples/s are collected by the sensor
+    sensor_sample_rate = 400
+    sensor.set_sample_rate(sensor_sample_rate)
 
-        # Expected acquisition rate: 400 Hz / 8 = 50 Hz
-        actual_acquisition_rate = int(sensor_sample_rate / sensor_fifo_average)
+    # Set the number of samples to be averaged per each reading
+    sensor_fifo_average = 8
+    sensor.set_fifo_average(sensor_fifo_average)
 
-        time.sleep(1)
+    # Set LED brightness to a medium value
+    sensor.set_active_leds_amplitude(MAX30105_PULSE_AMP_MEDIUM)
 
-        print(
-            "Starting data acquisition from RED & IR registers...",
-            "press Ctrl+C to stop.\n",
-        )
-        time.sleep(1)
+    # Expected acquisition rate: 400 Hz / 8 = 50 Hz
+    actual_acquisition_rate = int(sensor_sample_rate / sensor_fifo_average)
 
-        # Initialize the heart rate monitor
-        hr_monitor = HeartRateMonitor(
-            # Select a sample rate that matches the sensor's acquisition rate
-            sample_rate=actual_acquisition_rate,
-            # Select a significant window size to calculate the heart rate (2-5 seconds)
-            window_size=int(actual_acquisition_rate * 3),
-        )
+    time.sleep(1)
 
-        # Setup to calculate the heart rate every 2 seconds
-        hr_compute_interval = 2  # seconds
-        ref_time = time.monotonic_ns() // 1_000_000  # Reference time
+    print(
+        "Starting data acquisition from RED & IR registers...",
+        "press Ctrl+C to stop.",
+        "\n",
+    )
+    time.sleep(1)
 
-        while True:
-            # The check() method has to be continuously polled, to check if
-            # there are new readings into the sensor's FIFO queue. When new
-            # readings are available, this function will put them into the storage queue.
-            sensor.check()
+    # Initialize the heart rate monitor
+    hr_monitor = HeartRateMonitor(
+        # Select a sample rate that matches the sensor's acquisition rate
+        sample_rate=actual_acquisition_rate,
+        # Select a significant window size to calculate the heart rate (2-5 seconds)
+        window_size=int(actual_acquisition_rate * 3),
+    )
 
-            # Drain all queued samples from the queue
-            while sensor.available():
-                # Access the storage FIFO and gather the readings (integers)
-                red_reading = sensor.pop_red_from_storage()
-                ir_reading = sensor.pop_ir_from_storage()
+    # Setup to calculate the heart rate every 2 seconds
+    hr_compute_interval = 2  # seconds
+    ref_time = ticks_ms()  # Reference time
 
-                # Add the IR reading to the heart rate monitor
-                # Note: based on the skin color, the red, IR or green LED can be used
-                # to calculate the heart rate with more accuracy.
-                hr_monitor.add_sample(ir_reading)
+    while True:
+        # The check() method has to be continuously polled, to check if
+        # there are new readings into the sensor's FIFO queue. When new
+        # readings are available, this function will put them into the storage queue.
+        sensor.check()
 
-            # Periodically calculate the heart rate every `hr_compute_interval` seconds
-            now = time.monotonic_ns() // 1_000_000
-            if (now - ref_time) / 1000 > hr_compute_interval:
-                # Calculate the heart rate
-                heart_rate = hr_monitor.calculate_heart_rate()
-                if heart_rate is not None:
-                    print("Heart Rate: {:.0f} BPM".format(heart_rate))
-                else:
-                    print("Not enough data to calculate heart rate")
-                # Reset the reference time
-                ref_time = now
+        # Drain all queued samples from the queue
+        while sensor.available():
+            # Access the storage FIFO and gather the readings (integers)
+            red_reading = sensor.pop_red_from_storage()
+            ir_reading = sensor.pop_ir_from_storage()
+
+            # Add the IR reading to the heart rate monitor
+            # Note: based on the skin color, the red, IR or green LED can be used
+            # to calculate the heart rate with more accuracy.
+            hr_monitor.add_sample(ir_reading)
+
+        # Periodically calculate the heart rate every `hr_compute_interval` seconds
+        if ticks_diff(ticks_ms(), ref_time) / 1000 > hr_compute_interval:
+            # Calculate the heart rate
+            heart_rate = hr_monitor.calculate_heart_rate()
+            if heart_rate is not None:
+                print("Heart Rate: {:.0f} BPM".format(heart_rate))
+            else:
+                print("Not enough data to calculate heart rate")
+            # Reset the reference time
+            ref_time = ticks_ms()
 
 
 if __name__ == "__main__":

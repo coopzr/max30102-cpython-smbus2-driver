@@ -20,87 +20,119 @@ averages the samples before putting them into the FIFO queue (by default, 8 samp
 
 Author: n-elia
 """
+
 import time
 
-from max30102 import MAX30102, MAX30105_PULSE_AMP_MEDIUM, scan
+from smbus2 import SMBus, i2c_msg
+
+from max30102 import MAX30102, MAX30105_PULSE_AMP_MEDIUM
 
 # I2C bus number. On a Raspberry Pi, bus 1 is the usual /dev/i2c-1 header;
 # run `i2cdetect -y 1` to confirm.
 I2C_BUS = 1
 
 
+def ticks_us():
+    return time.monotonic_ns() // 1000
+
+
+def ticks_ms():
+    return time.monotonic_ns() // 1000000
+
+
+def ticks_diff(a, b):
+    return a - b
+
+
+# Probe the bus for responding I2C addresses (smbus2 has no scan())
+def scan(i2c):
+    found = []
+    for address in range(0x03, 0x78):
+        try:
+            i2c.i2c_rdwr(i2c_msg.write(address, b""))
+        except OSError:
+            continue
+        found.append(address)
+    return found
+
+
 def main():
-    with MAX30102(bus=I2C_BUS) as sensor:
-        # Scan I2C bus to ensure that the sensor is connected
-        if sensor.i2c_address not in scan(sensor.i2c):
-            print("Sensor not found.")
-            return
-        elif not sensor.check_part_id():
-            # Check that the targeted sensor is compatible
-            print("I2C device ID not corresponding to MAX30102 or MAX30105.")
-            return
-        else:
-            print("Sensor connected and recognized.")
+    # I2C bus instance
+    i2c = SMBus(I2C_BUS)
 
-        # It's possible to set up the sensor at once with the setup_sensor() method.
-        # If no parameters are supplied, the default config is loaded:
-        # Led mode: 2 (RED + IR)
-        # ADC range: 16384
-        # Sample rate: 400 Hz
-        # Led power: maximum (50.0mA - Presence detection of ~12 inch)
-        # Averaged samples: 8
-        # pulse width: 411
-        print("Setting up sensor with default configuration.\n")
-        sensor.setup_sensor()
+    # Sensor instance
+    sensor = MAX30102(i2c=i2c)  # An I2C instance is required
 
-        # It is also possible to tune the configuration parameters one by one.
-        # Set the sample rate to 400: 400 samples/s are collected by the sensor
-        sensor.set_sample_rate(400)
-        # Set the number of samples to be averaged per each reading
-        sensor.set_fifo_average(8)
-        # Set LED brightness to a medium value
-        sensor.set_active_leds_amplitude(MAX30105_PULSE_AMP_MEDIUM)
+    # Scan I2C bus to ensure that the sensor is connected
+    if sensor.i2c_address not in scan(i2c):
+        print("Sensor not found.")
+        return
+    elif not (sensor.check_part_id()):
+        # Check that the targeted sensor is compatible
+        print("I2C device ID not corresponding to MAX30102 or MAX30105.")
+        return
+    else:
+        print("Sensor connected and recognized.")
 
-        time.sleep(1)
+    # It's possible to set up the sensor at once with the setup_sensor() method.
+    # If no parameters are supplied, the default config is loaded:
+    # Led mode: 2 (RED + IR)
+    # ADC range: 16384
+    # Sample rate: 400 Hz
+    # Led power: maximum (50.0mA - Presence detection of ~12 inch)
+    # Averaged samples: 8
+    # pulse width: 411
+    print("Setting up sensor with default configuration.", '\n')
+    sensor.setup_sensor()
 
-        # The readTemperature() method allows to extract the die temperature in °C
-        print("Reading temperature in °C.\n")
-        print(sensor.read_temperature())
+    # It is also possible to tune the configuration parameters one by one.
+    # Set the sample rate to 400: 400 samples/s are collected by the sensor
+    sensor.set_sample_rate(400)
+    # Set the number of samples to be averaged per each reading
+    sensor.set_fifo_average(8)
+    # Set LED brightness to a medium value
+    sensor.set_active_leds_amplitude(MAX30105_PULSE_AMP_MEDIUM)
 
-        # Select whether to compute the acquisition frequency or not
-        compute_frequency = True
+    time.sleep(1)
 
-        print("Starting data acquisition from RED & IR registers...\n")
-        time.sleep(1)
+    # The readTemperature() method allows to extract the die temperature in °C    
+    print("Reading temperature in °C.", '\n')
+    print(sensor.read_temperature())
 
-        t_start = time.monotonic()  # Starting time of the acquisition
-        samples_n = 0  # Number of samples that have been collected
+    # Select whether to compute the acquisition frequency or not
+    compute_frequency = True
 
-        while True:
-            # The check() method has to be continuously polled, to check if
-            # there are new readings into the sensor's FIFO queue. When new
-            # readings are available, this function will put them into the storage queue.
-            sensor.check()
+    print("Starting data acquisition from RED & IR registers...", '\n')
+    time.sleep(1)
 
-            # Drain all queued samples from the queue
-            while sensor.available():
-                # Access the storage FIFO and gather the readings (integers)
-                red_reading = sensor.pop_red_from_storage()
-                ir_reading = sensor.pop_ir_from_storage()
+    t_start = ticks_us()  # Starting time of the acquisition
+    samples_n = 0  # Number of samples that have been collected
 
-                # Print the acquired data (so that it can be redirected to a file or plotted)
-                print(red_reading, ",", ir_reading)
+    while True:
+        # The check() method has to be continuously polled, to check if
+        # there are new readings into the sensor's FIFO queue. When new
+        # readings are available, this function will put them into the storage queue.
+        sensor.check()
 
-                # Compute the real frequency at which we receive data
-                if compute_frequency:
-                    if time.monotonic() - t_start >= 1.0:
-                        f_hz = samples_n
-                        samples_n = 0
-                        print("acquisition frequency = ", f_hz)
-                        t_start = time.monotonic()
-                    else:
-                        samples_n = samples_n + 1
+        # Drain all queued samples from the queue
+        while sensor.available():
+            # Access the storage FIFO and gather the readings (integers)
+            red_reading = sensor.pop_red_from_storage()
+            ir_reading = sensor.pop_ir_from_storage()
+
+            # Print the acquired data (so that it can be redirected to a file or plotted)
+            print(red_reading, ",", ir_reading)
+
+            # Compute the real frequency at which we receive data
+            if compute_frequency:
+                if ticks_diff(ticks_us(), t_start) >= 999999:
+                    f_HZ = samples_n
+                    samples_n = 0
+                    print("acquisition frequency = ", f_HZ)
+                    t_start = ticks_us()
+                else:
+                    samples_n = samples_n + 1
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

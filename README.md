@@ -4,6 +4,9 @@ A CPython + [`smbus2`](https://pypi.org/project/smbus2/) port of
 [n-elia/MAX30102-MicroPython-driver](https://github.com/n-elia/MAX30102-MicroPython-driver), for Linux
 boards such as the Raspberry Pi.
 
+> **This is the `vanilla` branch:** a like-for-like port of n-elia's driver, with no fixes or additions.
+> It is untested and unsupported. Further development happens on the `master` branch.
+
 It _should_ work for MAX30105, too.
 
 ## Table of contents
@@ -29,14 +32,13 @@ its functionalities. Please do not rely on it for medical purposes or profession
 ## Branches
 
 - `master` -- the development branch, with bug fixes and additions on top of the original driver.
-- `vanilla` (this branch) -- stays close to the original MicroPython driver, plus the `swap_red_ir` option.
+- `vanilla` (this branch) -- a like-for-like port of the original MicroPython driver. Untested and unsupported.
 
 ## Usage
 
-Driver usage is quite straightforward. You just need to import the library, and to give it an I2C bus.
+Driver usage is quite straightforward. You just need to import the library, and to set up an `SMBus` instance.
 
-A full example is provided in `examples/basic_usage.py`. For a step-by-step walkthrough (wiring, raw readings, heart
-rate, SpO2), see [USAGE.md](USAGE.md).
+A full example is provided in `examples/basic_usage.py`.
 
 ### 1 - Including this library into your project
 
@@ -65,26 +67,16 @@ from max30102 import MAX30102
 
 #### I2C connection
 
-Pass the I2C bus number, and the driver opens (and closes) the bus itself:
-
-```python
-from max30102 import MAX30102, scan
-
-with MAX30102(bus=1) as sensor:
-    if sensor.i2c_address not in scan(sensor.i2c):
-        print("Sensor not found.")
-    ...
-```
-
-Or pass an `smbus2.SMBus` instance that you manage yourself:
+Create an `SMBus` instance as in the following example:
 
 ```python
 from smbus2 import SMBus
-from max30102 import MAX30102
 
-with SMBus(1) as bus:
-    sensor = MAX30102(i2c=bus)
-    ...
+my_i2c_bus = 1  # I2C bus number here!
+
+i2c = SMBus(my_i2c_bus)
+
+sensor = MAX30102(i2c=i2c)
 ```
 
 On a Raspberry Pi, bus 1 is `/dev/i2c-1` on the 40-pin header (SDA = GPIO 2, SCL = GPIO 3).
@@ -271,11 +263,7 @@ This work is a lot based on:
 There is an issue involving chinese clones of the Maxim MAX30102: some of them appear to have the red and IR registers
 inverted (or maybe the LEDs swapped) (see [here](https://github.com/aromring/MAX30102_by_RF/issues/13)). You can easily
 check if your sensor is inverted by putting it in LED mode 1: only the red LED should work. If you see the IR LED (use
-your phone camera to check), pass `swap_red_ir=True` so that "red" and "IR" in this library refer to the physical LEDs:
-
-```python
-sensor = MAX30102(bus=1, swap_red_ir=True)
-```
+your phone camera to check), then you have to collect IR samples as red ones and viceversa.
 
 ### Heartrate and SPO2 estimation
 
@@ -283,4 +271,4 @@ If you're looking for algorithms for extracting heartrate and SPO2 from your RAW
 look [here](https://github.com/aromring/MAX30102_by_RF)
 and [here](https://github.com/kandizzy/esp32-micropython/tree/master/PPG).
 
-Basic examples are also available in `examples/heart_rate.py` and `examples/spo2.py`.
+A basic example of heartrate detection is also available in `examples/heart_rate.py`.

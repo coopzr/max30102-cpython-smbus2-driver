@@ -184,32 +184,11 @@ class SensorData:
 # Sensor class
 class MAX30102(object):
     def __init__(self,
-                 i2c: SMBus = None,
-                 bus: int = None,
+                 i2c: SMBus,
                  i2c_hex_address=MAX3010X_I2C_ADDRESS,
-                 swap_red_ir=False,
                  ):
-        # Supply exactly one of 'i2c' (an already-open smbus2.SMBus, owned
-        # by the caller) or 'bus' (an I2C bus number, e.g. 1, which the
-        # driver opens and closes itself).
-        if (i2c is None) == (bus is None):
-            raise ValueError(
-                "Provide exactly one of 'i2c' (an existing SMBus instance) "
-                "or 'bus' (an I2C bus number to open)"
-            )
-        if bus is not None:
-            i2c = SMBus(bus)
-            self._owns_i2c = True
-        else:
-            self._owns_i2c = False
-
         self.i2c_address = i2c_hex_address
         self._i2c = i2c
-        # Some clone boards (e.g. the MH-ET LIVE MAX30102) have the red and
-        # IR LEDs reversed: with swap_red_ir=True, "red" and "IR" in this
-        # API refer to the physical LEDs. Note that led_mode=1 then samples
-        # the physical IR LED (slot 1) into sense.IR.
-        self._swap_red_ir = bool(swap_red_ir)
         self._active_leds = None
         self._pulse_width = None
         self._multi_led_read_mode = None
@@ -257,33 +236,7 @@ class MAX30102(object):
         self.clear_fifo()
 
     def __del__(self):
-        # Ignore errors during interpreter teardown (the bus may already
-        # be closed)
-        try:
-            self.shutdown()
-        except Exception:
-            pass
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    def close(self):
-        # Close the bus only if it was opened by this instance (bus=<n>)
-        if self._owns_i2c:
-            self._i2c.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    @property
-    def i2c(self):
-        """The underlying smbus2.SMBus instance (opened via `bus=`, or the
-        one supplied via `i2c=`). Handy for e.g. `scan(sensor.i2c)`."""
-        return self._i2c
+        self.shutdown()
 
     # Methods to read the two interrupt flags
     def get_int_1(self):
@@ -469,12 +422,10 @@ class MAX30102(object):
             self.set_pulse_amplitude_green(amplitude)
 
     def set_pulse_amplitude_red(self, amplitude):
-        reg = MAX30105_LED2_PULSE_AMP if self._swap_red_ir else MAX30105_LED1_PULSE_AMP
-        self.i2c_set_register(reg, amplitude)
+        self.i2c_set_register(MAX30105_LED1_PULSE_AMP, amplitude)
 
     def set_pulse_amplitude_ir(self, amplitude):
-        reg = MAX30105_LED1_PULSE_AMP if self._swap_red_ir else MAX30105_LED2_PULSE_AMP
-        self.i2c_set_register(reg, amplitude)
+        self.i2c_set_register(MAX30105_LED2_PULSE_AMP, amplitude)
 
     def set_pulse_amplitude_green(self, amplitude):
         self.i2c_set_register(MAX30105_LED3_PULSE_AMP, amplitude)
@@ -736,19 +687,16 @@ class MAX30102(object):
                                                     self._multi_led_read_mode)
 
                 # Convert the readings from bytes to integers, depending
-                # on the number of active LEDs. FIFO channel 1 is red and
-                # channel 2 is IR per the datasheet; swap_red_ir reverses
-                # that for boards whose LEDs are physically swapped.
-                if self._swap_red_ir:
-                    first, second = self.sense.IR, self.sense.red
-                else:
-                    first, second = self.sense.red, self.sense.IR
-
+                # on the number of active LEDs
                 if self._active_leds > 0:
-                    first.append(self.fifo_bytes_to_int(fifo_bytes[0:3]))
+                    self.sense.red.append(
+                        self.fifo_bytes_to_int(fifo_bytes[0:3])
+                    )
 
                 if self._active_leds > 1:
-                    second.append(self.fifo_bytes_to_int(fifo_bytes[3:6]))
+                    self.sense.IR.append(
+                        self.fifo_bytes_to_int(fifo_bytes[3:6])
+                    )
 
                 if self._active_leds > 2:
                     self.sense.green.append(
@@ -771,15 +719,3 @@ class MAX30102(object):
                 # new data found
                 return True
             sleep_ms(1)
-
-
-# Probe the bus for responding I2C addresses
-def scan(i2c: SMBus, start=0x03, end=0x77):
-    found = []
-    for address in range(start, end + 1):
-        try:
-            i2c.i2c_rdwr(i2c_msg.write(address, b""))
-        except OSError:
-            continue
-        found.append(address)
-    return found
