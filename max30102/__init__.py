@@ -227,6 +227,7 @@ class MAX30102(object):
 
         self.i2c_address = i2c_hex_address
         self._i2c = i2c
+        self._closed = False
         # Some clone boards (e.g. the MH-ET LIVE MAX30102) have the red and
         # IR LEDs reversed: with swap_red_ir=True, "red" and "IR" in this
         # API refer to the physical LEDs. Note that led_mode=1 then samples
@@ -288,21 +289,30 @@ class MAX30102(object):
         self.clear_fifo()
 
     def __del__(self):
-        # Ignore errors during interpreter teardown (the bus may already
-        # be closed)
-        try:
-            self.shutdown()
-        except Exception:
-            pass
+        # Safety net for a sensor that was never closed. Ignore errors
+        # during interpreter teardown (the bus may already be closed)
         try:
             self.close()
         except Exception:
             pass
 
     def close(self):
-        # Close the bus only if it was opened by this instance (bus=<n>)
-        if self._owns_i2c:
-            self._i2c.close()
+        # Put the sensor into shutdown (LEDs off), then close the bus if it
+        # was opened by this instance (bus=<n>). Shut down first: it needs
+        # the bus. Calling close() again does nothing.
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.shutdown()
+        except OSError:
+            # The sensor isn't answering (e.g. not wired up): nothing to
+            # shut down, and an error raised inside a `with` block must not
+            # be replaced by this one
+            pass
+        finally:
+            if self._owns_i2c:
+                self._i2c.close()
 
     def __enter__(self):
         return self

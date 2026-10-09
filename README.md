@@ -82,10 +82,13 @@ Or pass an `smbus2.SMBus` instance that you manage yourself:
 from smbus2 import SMBus
 from max30102 import MAX30102
 
-with SMBus(1) as bus:
-    sensor = MAX30102(i2c=bus)
+with SMBus(1) as bus, MAX30102(i2c=bus) as sensor:
     ...
 ```
+
+Leaving the sensor's `with` block (or calling `sensor.close()`) puts the sensor into shutdown, turning its LEDs off,
+and then closes the bus if the driver opened it. A bus passed with `i2c=` is left open. Close the sensor before its
+bus: once the bus is closed, the driver can't reach the sensor to shut it down.
 
 On a Raspberry Pi, bus 1 is `/dev/i2c-1` on the 40-pin header (SDA = GPIO 2, SCL = GPIO 3).
 

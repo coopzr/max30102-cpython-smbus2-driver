@@ -1,6 +1,8 @@
 """Unit tests: buffer semantics, FIFO decoding, get_red/get_ir/get_green,
-config validation, bus ownership, and scan().
+config validation, bus ownership, and scan(); plus plausible-use scenarios
+on the mock hardware.
 """
+import gc
 import struct
 import sys
 from pathlib import Path
@@ -480,3 +482,90 @@ def test_swap_red_ir_swaps_led_amplitude_registers():
     sensor.set_pulse_amplitude_ir(0x22)
     assert device._get(0x0D) == 0x11  # physical red is LED2
     assert device._get(0x0C) == 0x22
+
+
+# --------------------------------------------------------------------------
+# Plausible-use scenarios on the mock hardware: DeviceSim does only what the
+# chip can do (DeviceSim.produce() queues samples only while it is sampling)
+# and FakeSMBus fails after close() like smbus2.
+# --------------------------------------------------------------------------
+
+def _patch_smbus(monkeypatch, device):
+    """Make MAX30102(bus=<n>) open a FakeSMBus wired to `device`. Returns
+    the list of buses it opens."""
+    opened = []
+
+    def open_bus(bus_number):
+        opened.append(FakeSMBus(device))
+        return opened[-1]
+
+    monkeypatch.setattr(mod, "SMBus", open_bus)
+    return opened
+
+
+# Shutdown: leaving the sensor's `with` block turns the LEDs off
+
+def test_ctrl_c_out_of_example_loop_turns_leds_off(monkeypatch):
+    # examples/basic_usage.py: the loop runs until the user presses Ctrl+C
+    device = DeviceSim()
+    opened = _patch_smbus(monkeypatch, device)
+    with pytest.raises(KeyboardInterrupt):
+        with mod.MAX30102(bus=1) as sensor:
+            sensor.setup_sensor()
+            device.produce([(1000, 2000), (1001, 2001)])
+            sensor.check()
+            while sensor.available():
+                sensor.pop_red_from_storage()
+                sensor.pop_ir_from_storage()
+            assert device.led_current_ma(1) == 25.4
+            raise KeyboardInterrupt
+    del sensor  # the program exits
+    gc.collect()
+
+    assert opened[0]._closed
+    assert device.led_current_ma(1) == 0
+    assert device.led_current_ma(2) == 0
+
+
+def test_injected_bus_with_blocks_turn_leds_off():
+    device = DeviceSim()
+    with FakeSMBus(device) as bus, mod.MAX30102(i2c=bus) as sensor:
+        sensor.setup_sensor()
+        device.produce([(1000, 2000)])
+        sensor.check()
+    del sensor  # the program exits
+    gc.collect()
+
+    assert device.led_current_ma(1) == 0
+    assert device.led_current_ma(2) == 0
+
+
+def test_no_sensor_on_bus_exits_cleanly(monkeypatch):
+    # Wiring fault: the examples print "Sensor not found." and return
+    opened = _patch_smbus(monkeypatch, None)
+    with mod.MAX30102(bus=1) as sensor:
+        assert sensor.i2c_address not in mod.scan(sensor.i2c)
+    assert opened[0]._closed
+
+
+def test_next_run_after_close_samples_again(monkeypatch):
+    device = DeviceSim()
+    _patch_smbus(monkeypatch, device)
+    with mod.MAX30102(bus=1) as sensor:  # first run
+        sensor.setup_sensor()
+    with mod.MAX30102(bus=1) as sensor:  # next run
+        sensor.setup_sensor()
+        assert device.produce([(1000, 2000)]) == 1
+        assert sensor.read_sample() == (1000, 2000)
+
+
+def test_no_bus_traffic_after_close(monkeypatch):
+    device = DeviceSim()
+    opened = _patch_smbus(monkeypatch, device)
+    with mod.MAX30102(bus=1) as sensor:
+        sensor.setup_sensor()
+    transactions = len(opened[0].log)
+    sensor.close()
+    sensor.__del__()
+    assert len(opened[0].log) == transactions
+

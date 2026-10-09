@@ -1,8 +1,9 @@
 """A tiny deterministic model of the MAX30102 register file + FIFO.
 
-This is not a datasheet-accurate simulation of the physical sensor: it
-gives the driver something to talk to in tests. Starting register values
-don't need to match real silicon.
+This is not a full simulation of the physical sensor: it gives the driver
+something to talk to in tests. Starting register values don't need to match
+real silicon, but what the model does (reset, sampling, LED current) follows
+the datasheet, so tests can only stage states the real chip can reach.
 
 Addressing mirrors the real device: a 1-byte write sets the "current
 register" pointer, a 2-byte write sets the pointer *and* writes a value to
@@ -36,8 +37,22 @@ REG_PROX_INT_THRESH = 0x30
 REG_REVISION_ID = 0xFE
 REG_PART_ID = 0xFF
 
+SHDN_BIT = 0x80
 RESET_BIT = 0x40
 TEMP_EN_BIT = 0x01
+
+# MODE[2:0] values that take readings (datasheet pag. 18, Table 4)
+MODE_HR = 0x02
+MODE_SPO2 = 0x03
+MODE_MULTI_LED = 0x07
+
+SAMPLE_RATES = (50, 100, 200, 400, 800, 1000, 1600, 3200)  # Table 6
+SAMPLE_AVERAGES = (1, 2, 4, 8, 16, 32, 32, 32)  # Table 3
+PULSE_WIDTHS = (69, 118, 215, 411)  # Table 7
+
+# Highest allowed sample rate for each pulse width (datasheet pag. 23)
+MAX_SAMPLE_RATE_SPO2 = {69: 1600, 118: 1000, 215: 800, 411: 400}  # Table 11
+MAX_SAMPLE_RATE_HR = {69: 3200, 118: 1600, 215: 1600, 411: 1000}  # Table 12
 
 # Registers that never change, regardless of resets or writes.
 _FIXED_REGISTERS = {
@@ -88,11 +103,12 @@ class DeviceSim:
             self._addr_ptr = reg
             if reg == REG_MODE_CONFIG and (value & RESET_BIT):
                 # Datasheet: setting RESET reloads all registers to their
-                # power-on state, and the bit self-clears once done. We
-                # simulate that completing instantly (deterministic, and
+                # power-on state (MODE_CONFIG included, so the other bits of
+                # this write are lost), and the bit self-clears once done.
+                # We simulate that completing instantly (deterministic, and
                 # avoids an infinite poll loop in soft_reset()).
                 self._reset_to_defaults()
-                value &= ~RESET_BIT & 0xFF
+                return
             elif reg == REG_DIE_TEMP_CONFIG and (value & TEMP_EN_BIT):
                 # Datasheet: TEMP_EN self-clears once the temperature
                 # conversion completes. Simulated as completing instantly,
@@ -100,6 +116,11 @@ class DeviceSim:
                 # exits on its first check.
                 value &= ~TEMP_EN_BIT & 0xFF
             self._set(reg, value)
+            if reg in (REG_FIFO_WRITE_PTR, REG_FIFO_READ_PTR) and (
+                self._get(REG_FIFO_WRITE_PTR) == self._get(REG_FIFO_READ_PTR)
+            ):
+                # Equal pointers: the FIFO holds no unread samples (pag. 14)
+                self._fifo_queue.clear()
         else:
             raise ValueError(
                 "MAX30102 registers are only ever written as [reg] or "
@@ -148,6 +169,99 @@ class DeviceSim:
 
     def set_overflow_counter(self, value):
         self._registers[REG_FIFO_OVERFLOW] = value & 0xFF
+
+    # -- the chip at work (datasheet behavior, not I2C traffic) ----------
+    def _mode(self):
+        return self._get(REG_MODE_CONFIG) & 0x07
+
+    def _slots(self):
+        cfg1 = self._get(REG_MULTI_LED_CONFIG_1)
+        cfg2 = self._get(REG_MULTI_LED_CONFIG_2)
+        return [cfg1 & 0x07, (cfg1 >> 4) & 0x07, cfg2 & 0x07, (cfg2 >> 4) & 0x07]
+
+    def is_sampling(self):
+        """Readings are taken only in HR, SpO2 or multi-LED mode, and not
+        while SHDN is set (pag. 18)."""
+        if self._get(REG_MODE_CONFIG) & SHDN_BIT:
+            return False
+        return self._mode() in (MODE_HR, MODE_SPO2, MODE_MULTI_LED)
+
+    def pulsed_leds(self):
+        """The LEDs (1, 2) the chip is pulsing right now (Table 4, Table 9)."""
+        if not self.is_sampling():
+            return set()
+        if self._mode() == MODE_HR:
+            return {1}
+        if self._mode() == MODE_SPO2:
+            return {1, 2}
+        return {slot for slot in self._slots() if slot in (1, 2)}
+
+    def led_current_ma(self, led):
+        """Pulse current of LED1 or LED2: 0.2mA per LEDx_PA step (Table 8),
+        or 0 when the chip isn't pulsing that LED."""
+        if led not in self.pulsed_leds():
+            return 0.0
+        reg = REG_LED1_PULSE_AMP if led == 1 else REG_LED2_PULSE_AMP
+        return round(self._get(reg) * 0.2, 1)
+
+    def sample_rate(self):
+        return SAMPLE_RATES[(self._get(REG_PARTICLE_CONFIG) >> 2) & 0x07]
+
+    def pulse_width_us(self):
+        return PULSE_WIDTHS[self._get(REG_PARTICLE_CONFIG) & 0x03]
+
+    def fifo_rate_hz(self):
+        """Samples per second pushed to the FIFO: SPO2_SR / SMP_AVE."""
+        return self.sample_rate() / SAMPLE_AVERAGES[(self._get(REG_FIFO_CONFIG) >> 5) & 0x07]
+
+    def rate_allowed(self):
+        """Whether the sample rate is allowed at this pulse width in the
+        current mode (Tables 11 and 12, pag. 23)."""
+        if self._mode() == MODE_HR:
+            max_rate = MAX_SAMPLE_RATE_HR
+        elif self._mode() in (MODE_SPO2, MODE_MULTI_LED):
+            max_rate = MAX_SAMPLE_RATE_SPO2
+        else:
+            return True  # not sampling
+        return self.sample_rate() <= max_rate[self.pulse_width_us()]
+
+    def a_full_unread(self):
+        """Unread samples in the FIFO when A_FULL triggers (pag. 17)."""
+        return 32 - (self._get(REG_FIFO_CONFIG) & 0x0F)
+
+    def produce(self, samples):
+        """The chip takes readings: queue `samples` (each a tuple of ADC
+        counts, one per active channel) and advance FIFO_WR_PTR. Returns the
+        number queued: 0 when the chip isn't sampling.
+
+        Raises ValueError for samples this configuration can't produce, or
+        past the 32-sample FIFO depth (overflow isn't modeled).
+        """
+        if not self.is_sampling():
+            return 0
+        if self._mode() == MODE_HR:
+            channels = 1
+        elif self._mode() == MODE_SPO2:
+            channels = 2
+        else:
+            # Each non-zero slot adds a 3-byte channel (pag. 21)
+            channels = sum(1 for slot in self._slots() if slot)
+        bits = 15 + (self._get(REG_PARTICLE_CONFIG) & 0x03)  # Table 7
+        write_ptr = self._get(REG_FIFO_WRITE_PTR)
+        unread = (write_ptr - self._get(REG_FIFO_READ_PTR)) & 0x1F
+        if unread + len(samples) > 32:
+            raise ValueError("the FIFO holds 32 samples (pag. 14)")
+        for sample in samples:
+            if len(sample) != channels:
+                raise ValueError("this mode produces {0}-channel samples".format(channels))
+            for value in sample:
+                if not 0 <= value < (1 << bits):
+                    raise ValueError("{0} doesn't fit a {1}-bit ADC".format(value, bits))
+                # Left-justified in 18 bits (Table 1), MSB first (Table 2)
+                word = value << (18 - bits)
+                self._fifo_queue.extend(((word >> 16) & 0x03, (word >> 8) & 0xFF, word & 0xFF))
+        self._registers[REG_FIFO_WRITE_PTR] = (write_ptr + len(samples)) & 0x1F
+        return len(samples)
 
     def _pop_fifo(self, n_bytes):
         out = bytearray()
