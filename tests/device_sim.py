@@ -1,9 +1,8 @@
 """A tiny deterministic model of the MAX30102 register file + FIFO.
 
 This is not a datasheet-accurate simulation of the physical sensor: it
-gives the drivers under test something to talk to, so their I2C traffic can
-be checked (see test_equivalence.py). Starting register values don't need
-to match real silicon, only to be the same for every instance.
+gives the driver something to talk to in tests. Starting register values
+don't need to match real silicon.
 
 Addressing mirrors the real device: a 1-byte write sets the "current
 register" pointer, a 2-byte write sets the pointer *and* writes a value to
