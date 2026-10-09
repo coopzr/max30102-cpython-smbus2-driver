@@ -18,10 +18,12 @@ that's on you.
 This work is not intended to be used in professional environments, and there are no guarantees on
 its functionalities. Please do not rely on it for medical purposes or professional usage.
 
-## `experimental_v2` branch
+## Branches
 
-The `experimental_v2` branch contains Claude's bug fixes on top of `master`, applied per a
-spec-audit triage.
+- `master` -- the development branch. It contains Claude's bug fixes, applied per a spec-audit
+  triage (see `SPEC_AUDIT.md` and `SPEC_AUDIT_TRIAGE.md`).
+- `vanilla` (this branch) -- the original port **without** Claude's bug fixes. It additionally
+  includes the `swap_red_ir` option (see [Clone boards with reversed LEDs](#clone-boards-with-reversed-leds)).
 
 ## Install
 
@@ -77,6 +79,16 @@ with SMBus(1) as bus:
 See `examples/basic_usage.py` for a full runnable example (prints RED/IR samples and the
 measured acquisition frequency), and `examples/heart_rate.py` for a simple peak-finding BPM
 estimate from the IR channel.
+
+### Clone boards with reversed LEDs
+
+Some clone boards (e.g. the MH-ET LIVE MAX30102) have the red and IR LEDs reversed relative to
+the datasheet. Pass `swap_red_ir=True` to exchange the FIFO channels and the LED1/LED2 amplitude
+registers, so "red" and "IR" in this driver's API refer to the *physical* LEDs:
+
+```python
+sensor = MAX30102(bus=1, swap_red_ir=True)
+```
 
 ### Data acquisition rate
 
