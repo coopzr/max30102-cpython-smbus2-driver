@@ -45,7 +45,7 @@ yourself to the `i2c` group and log out/in once: `sudo usermod -aG i2c $USER`.
 Then get the driver itself:
 
 ```bash
-pip install .   # from this project's root
+pip install .[hrspo2]   # from this project's root; [hrspo2] adds numpy + scipy for heart rate / SpO2
 # or copy this project's max30102/ directory into yours
 ```
 
@@ -58,13 +58,17 @@ light reflects back off whatever's pressed against it (normally a fingertip). Th
 numbers are the foundation for everything else below.
 
 ```python
+import time
+
 from max30102 import MAX30102
 
 with MAX30102(bus=1) as sensor:
     sensor.setup_sensor()  # load sensible defaults and start sampling
+    sensor.clear_fifo()    # start the loop from an empty buffer
 
     while True:
-        sensor.check()  # ask the sensor if new readings are ready
+        time.sleep(0.1)    # let a few readings pile up
+        sensor.check()     # ask the sensor for the new readings
         while sensor.available():
             red = sensor.pop_red_from_storage()
             ir = sensor.pop_ir_from_storage()
@@ -81,6 +85,14 @@ That's the whole loop every example in this guide builds on:
 1. `sensor.check()` -- pulls any new readings out of the sensor's internal buffer.
 2. `sensor.available()` -- how many readings are waiting to be read.
 3. `sensor.pop_red_from_storage()` / `pop_ir_from_storage()` -- take one reading each.
+
+Why the `sleep()`: the sensor keeps up to 32 readings in its own buffer (0.64 seconds' worth with
+the defaults), so there's no need to ask it constantly -- every 0.1 to 0.2 seconds is plenty and
+leaves the CPU idle. Don't wait *much* longer than that, though, or the buffer fills up and the
+oldest readings are lost; `sensor.lost_samples` counts any that were. That's also why the loop
+starts with `clear_fifo()`: the sensor starts measuring at `setup_sensor()`, and anything slow in
+between (printing, reading the temperature, a `sleep()`) would otherwise leave a full,
+overflowing buffer for the first `check()`.
 
 A fuller version of this script -- with a sensor-detection check and live acquisition-rate
 reporting -- is at [`examples/basic_usage.py`](examples/basic_usage.py).
@@ -107,110 +119,73 @@ and stay lit after your program exits.
 
 ---
 
-## 2. Heart rate
+## 2. Heart rate and blood oxygen (SpO2)
 
 Every heartbeat pushes a small pulse of blood through your fingertip, which briefly changes how
-much light gets absorbed. That shows up as a small, regular wobble on top of the IR reading --
-"regular wobble" is exactly what a heart rate monitor looks for: it watches the IR signal for
-repeating peaks and turns the time between peaks into beats-per-minute (BPM).
+much light gets absorbed. That shows up as a small, regular wobble on top of the RED and IR
+readings. The time it takes the wobble to repeat is one heartbeat; the size of the wobble on the
+RED channel compared to the IR channel tells you how much oxygen the blood carries (oxygenated
+blood absorbs more infrared, deoxygenated blood more red).
 
-```python
-from max30102 import MAX30102
-
-with MAX30102(bus=1) as sensor:
-    sensor.setup_sensor()
-
-    ir_samples = []
-    while True:
-        sensor.check()
-        while sensor.available():
-            sensor.pop_red_from_storage()  # not needed for heart rate; discard
-            ir_samples.append(sensor.pop_ir_from_storage())
-            if len(ir_samples) > 100:
-                ir_samples.pop(0)  # keep a rolling window of the last ~2 seconds
-
-        # ... peak-finding and BPM math goes here (see below)
-```
-
-Finding peaks reliably (and ignoring noise) takes a bit more than a few lines, so this driver
-ships a ready-to-run version at [`examples/heart_rate.py`](examples/heart_rate.py):
+The driver ships an estimator that does both, in `max30102.hr_spo2` (it needs numpy and scipy:
+`pip install .[hrspo2]`). Run the ready-made example:
 
 ```bash
-python examples/heart_rate.py
+python examples/heart_rate_spo2.py
 ```
 
-Rest a fingertip gently on the sensor and hold still; after a few seconds it will start printing
-a BPM reading roughly every 2 seconds. If readings look wildly off or don't appear, press a bit
-more firmly (too light a touch lets ambient light interfere) but not hard enough to cut off blood
-flow (too hard flattens the pulse signal).
+Sit down, rest a fingertip gently on the sensor and hold still. After about 6 seconds it starts
+printing a heart rate and an SpO2 estimate once a second, or "No reading" when the signal isn't
+clean enough to trust.
 
-**How it works, briefly:** `examples/heart_rate.py` defines a `HeartRateMonitor` class that
-removes each sample's slow-moving baseline (DC removal) before smoothing the incoming IR
-samples (to reduce noise), looks for local peaks above a threshold set from the recent min/max
-range, rejects any peak within 300ms of the last accepted one (a refractory period, to avoid
-double-counting a single heartbeat's dicrotic notch as two beats), and averages the time between
-consecutive accepted peaks to get BPM (`60000 / average_interval_ms`). Peaks are timestamped by
-sample index against the sensor's own acquisition rate, not wall-clock time, so the result doesn't
-depend on how promptly the host happens to poll.
-
----
-
-## 3. Blood oxygen (SpO2)
-
-Blood oxygen estimation compares how RED and IR light are absorbed differently by
-oxygen-rich vs. oxygen-poor blood: oxygenated blood absorbs more infrared, deoxygenated blood
-absorbs more red. By comparing the pulsing ("AC") part of each channel's signal against its
-steady ("DC") background level, you can compute a ratio that correlates with SpO2 percentage.
-
-Run the ready-made example:
-
-```bash
-python examples/spo2.py
-```
-
-Rest a fingertip gently on the sensor and hold still; it will print an estimated SpO2 percentage
-roughly every half second, and "No finger / signal too weak or invalid" when there's no usable
-pulsatile signal.
-
-**How it works, briefly** (see [`examples/spo2.py`](examples/spo2.py) for the full code):
+The core of it:
 
 ```python
-def compute_spo2(red_samples, ir_samples):
-    red_dc = sum(red_samples) / len(red_samples)
-    ir_dc = sum(ir_samples) / len(ir_samples)
+from max30102.hr_spo2 import HrSpO2Estimator
 
-    red_ac = _percentile_spread_ac(red_samples)  # 5th-95th percentile spread
-    ir_ac = _percentile_spread_ac(ir_samples)
-    perfusion_index = ir_ac / ir_dc
+sensor.setup_sensor(sample_rate=100, sample_avg=4, pulse_width=411)  # 25 readings/s
+estimator = HrSpO2Estimator(sample_rate=sensor.get_acquisition_frequency())
 
-    if ir_dc < IR_DC_FINGER_PRESENT_MIN or perfusion_index < PERFUSION_INDEX_MIN:
-        return None, perfusion_index  # no finger, or too weak/noisy to trust
-
-    r = (red_ac / red_dc) / (ir_ac / ir_dc)
-
-    # Empirical curve fit (Maxim AN6409) mapping the ratio to a percentage.
-    return -45.060 * r * r + 30.354 * r + 94.845, perfusion_index
+# in the loop, for every reading:
+estimate = estimator.add_sample(red, ir)
+if estimate is not None:  # once a second, from the last 6 seconds
+    print(estimate.heart_rate, estimate.spo2)  # either can be None: "no reading"
 ```
 
-1. **DC** (`red_dc`, `ir_dc`): the average brightness of each channel over a short window --
-   roughly, how much light is getting through overall.
-2. **AC** (`red_ac`, `ir_ac`): how much each channel wobbles within that window -- the pulse.
-   Estimated as a percentile spread (5th-to-95th) rather than raw peak-to-peak, so one motion-spike
-   sample doesn't dominate the estimate the way a single min/max reading would.
-3. **Signal-quality gate**: if the IR channel's DC level or perfusion index (AC/DC) is too low,
-   there's no finger on the sensor (or too weak a signal to trust), so no SpO2 number is reported
-   at all rather than a confident-looking but meaningless one.
-4. **R**: the ratio of (RED AC/DC) to (IR AC/DC). This one number is what actually correlates
-   with blood oxygen.
-5. A curve fit through R (values from Maxim's application note, reused across most open-source
-   MAX3010x projects) converts it to an approximate SpO2 percentage.
+**How it works, briefly** (see [`max30102/hr_spo2.py`](max30102/hr_spo2.py) for the full code):
 
-> **Accuracy note:** real pulse oximeters are individually calibrated against a reference device
-> and use additional signal processing (motion rejection, ambient-light compensation, and more).
-> The formula above is a widely-used *approximation*, not a calibrated one -- treat the output as
-> a rough estimate, not a medical reading. Expect it to be noisy with light finger pressure,
-> movement, or ambient light, and don't be surprised if it lands a few percentage points off a
-> real oximeter even when your finger is perfectly still.
+1. **Filter.** Each channel goes through a band-pass filter that keeps only 0.5-4 Hz (30-240
+   BPM). That removes the slow drift from breathing and finger pressure, and fast noise.
+2. **Heart rate.** It takes the last 6 seconds of IR, slides the waveform against a copy of
+   itself (autocorrelation) and finds the shift at which the two line up best: that shift is one
+   heartbeat. A pulse often has a second, smaller bump (the dicrotic notch); simple peak-counting
+   mistakes that for an extra beat, but it doesn't change how often the whole waveform repeats.
+   If the waveform doesn't repeat clearly enough, or RED and IR don't move together at all, no
+   reading. Six seconds is several beats, which makes the answer steadier while you sit still;
+   it also means one movement spoils several seconds of readings.
+3. **SpO2.** The ratio R = (RED wobble / RED level) / (IR wobble / IR level) goes into an
+   empirical curve from Maxim's application note to give a percentage. It needs RED and IR to
+   rise and fall closely together (a correlation of at least 0.8), because the ratio assumes
+   both channels see the same pulse. The RED pulse is weaker compared with its noise, so
+   sometimes you get a heart rate with "SpO2: no reading".
+4. **Slower than 40 BPM.** The heart-rate search stops at 40 BPM. A pulse also repeats every
+   second beat, so below that a normal pulse whose single-beat repeat is weak could pass for
+   one at half its rate. Instead, when the IR repeats 30-40 times a minute and its spectrum
+   shows that rhythm is its own (a normal pulse has no energy at half its rate),
+   `estimate.below_range` is True. The example prints "Heart rate below 40 BPM?" once that has
+   held for 7 estimates in a row: consecutive estimates share most of their samples, and 7 spans
+   two windows with no samples in common. It's a prompt to check, not a measurement, and only
+   while sitting still: breathing or finger pressure changing 30-40 times a minute can look the
+   same when the pulse is weak, walking can too, and a pulse below 30 BPM isn't detected at all.
+
+The estimator only answers when it is confident, so expect "No reading" often while you find a
+good finger position, and whenever you move. That's deliberate: a wrong number looks just as
+believable as a right one.
+
+> **Accuracy note:** real pulse oximeters are individually calibrated against a reference device.
+> The SpO2 curve here is a generic approximation, not a calibration for your sensor: expect it to
+> land a few percentage points off a real oximeter even when your finger is perfectly still, and
+> treat it as a rough estimate, not a medical reading.
 
 ---
 
@@ -222,13 +197,16 @@ def compute_spo2(red_samples, ir_samples):
 | `PermissionError` opening the bus | Add your user to the `i2c` group (`sudo usermod -aG i2c $USER`) and log back in, or run with `sudo`. |
 | `FileNotFoundError: [Errno 2] ... /dev/i2c-1` | I2C isn't enabled, or you're on a board where it's a different bus number -- try `bus=0` and check `ls /dev/i2c*`. |
 | Readings stuck near zero | No finger on the sensor, or it's pressed against something opaque with no skin contact. |
-| SpO2 stuck at 0% / "invalid" despite a clean pulse | Some clone boards (e.g. MH-ET LIVE) have the red and IR LEDs reversed vs. the datasheet. Pass `swap_red_ir=True` to `MAX30102(...)`. To check: enable one LED at a time (`set_pulse_amplitude_red(0)` etc.) and see which one glows visibly red -- the visible one is red; the other should show on a phone camera. |
-| Heart rate / SpO2 look noisy or don't appear | Hold still, use light-but-full finger contact, and keep the sensor away from direct sunlight or bright indoor lighting (both add noise to the readings). |
+| A steady heart rate, but SpO2 far too low or never shown | Some clone boards (e.g. MH-ET LIVE) have the red and IR LEDs reversed vs. the datasheet. Set `swap_red_ir` to match your board (`SWAP_RED_IR` in `examples/heart_rate_spo2.py`). To check: in LED mode 1 (`setup_sensor(led_mode=1)`) only the red LED should glow; if the one that lights is invisible to the eye but shows on a phone camera, it's IR and your board is swapped. |
+| "No reading" most of the time | Sit still, use light-but-full finger contact, and keep the sensor away from direct sunlight or bright indoor lighting. |
+| A heart rate, but "SpO2: no reading" in many lines | The RED pulse is too noisy to match the IR one: `estimate.correlation` is below 0.8. Adjust finger pressure, or raise `led_power`. If the correlation is above 0.8 and SpO2 is still missing, see the swapped-LED row above. |
+| "Heart rate below 40 BPM?" | A rhythm of 30-40 a minute was found that isn't a normal pulse. If your pulse isn't that slow (count it for 30 seconds), the usual cause is breathing or finger pressure changing at that pace while the pulse signal is weak: breathe normally, keep still and adjust finger contact. |
+| `I2C error, retrying` | A loose wire or a glitch on the bus. The examples keep going and lose no readings if it recovers within about a second. |
+| `ModuleNotFoundError: No module named 'numpy'` (or `scipy`) | Heart rate / SpO2 needs them: `pip install .[hrspo2]`. |
 
 ## Where to go next
 
 - [`README.md`](README.md) -- API reference and install details.
 - [`examples/basic_usage.py`](examples/basic_usage.py) -- MVP script with sensor detection and
   acquisition-rate reporting.
-- [`examples/heart_rate.py`](examples/heart_rate.py) -- full heart-rate example.
-- [`examples/spo2.py`](examples/spo2.py) -- full SpO2 example.
+- [`examples/heart_rate_spo2.py`](examples/heart_rate_spo2.py) -- full heart rate and SpO2 example.

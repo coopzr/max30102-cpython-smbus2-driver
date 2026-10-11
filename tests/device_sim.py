@@ -7,11 +7,18 @@ the datasheet, so tests can only stage states the real chip can reach.
 
 Addressing mirrors the real device: a 1-byte write sets the "current
 register" pointer, a 2-byte write sets the pointer *and* writes a value to
-it, and a read serves bytes starting at the pointer (auto-advancing through
-the FIFO queue for register 0x07, the only register the driver ever reads
-more than one byte from).
+it, and a read serves bytes starting at the pointer, auto-incrementing
+except at FIFO_DATA (0x07), which serves FIFO samples byte by byte
+(pag. 14, 15).
+
+The FIFO is 32 slots addressed by FIFO_WR_PTR / FIFO_RD_PTR. RD_PTR
+advances on the first byte of each sample, and writing either pointer
+restarts at a sample boundary (the behaviour check()'s error recovery relies
+on; TODO.md lists it for checking on hardware). With FIFO_ROLLOVER_EN a
+sample arriving while the FIFO is full replaces the oldest and moves both
+pointers; without it the new sample is discarded. Either way OVF_COUNTER
+counts it (saturating at 31) until the next sample is popped (pag. 13, 17).
 """
-from collections import deque
 
 REG_INT_STAT_1 = 0x00
 REG_INT_STAT_2 = 0x01
@@ -37,6 +44,8 @@ REG_PROX_INT_THRESH = 0x30
 REG_REVISION_ID = 0xFE
 REG_PART_ID = 0xFF
 
+PWR_RDY_BIT = 0x01
+ROLLOVER_BIT = 0x10
 SHDN_BIT = 0x80
 RESET_BIT = 0x40
 TEMP_EN_BIT = 0x01
@@ -74,14 +83,17 @@ class DeviceSim:
     def __init__(self):
         self._registers = {}
         self._addr_ptr = 0
-        self._fifo_queue = deque()
         self._reset_to_defaults()
+        # Power-up raises PWR_RDY (pag. 12); a soft reset doesn't (pag. 18)
+        self._registers[REG_INT_STAT_1] = PWR_RDY_BIT
 
     def _reset_to_defaults(self):
         self._registers = dict(_FIXED_REGISTERS)
         self._registers[REG_DIE_TEMP_INT] = _SIMULATED_DIE_TEMP_INT
         self._registers[REG_DIE_TEMP_FRAC] = _SIMULATED_DIE_TEMP_FRAC
-        self._fifo_queue.clear()
+        self._slots = [None] * 32
+        self._count = 0  # unread samples: 32 when full, though WR_PTR == RD_PTR
+        self._latched = b""  # the sample being read out of FIFO_DATA
 
     def _get(self, reg):
         return self._registers.get(reg, 0x00)
@@ -116,11 +128,11 @@ class DeviceSim:
                 # exits on its first check.
                 value &= ~TEMP_EN_BIT & 0xFF
             self._set(reg, value)
-            if reg in (REG_FIFO_WRITE_PTR, REG_FIFO_READ_PTR) and (
-                self._get(REG_FIFO_WRITE_PTR) == self._get(REG_FIFO_READ_PTR)
-            ):
-                # Equal pointers: the FIFO holds no unread samples (pag. 14)
-                self._fifo_queue.clear()
+            if reg in (REG_FIFO_WRITE_PTR, REG_FIFO_READ_PTR):
+                self._registers[reg] = value & 0x1F
+                # Equal pointers after a write: the FIFO is empty (pag. 14)
+                self._count = (self._get(REG_FIFO_WRITE_PTR) - self._get(REG_FIFO_READ_PTR)) & 0x1F
+                self._latched = b""
         else:
             raise ValueError(
                 "MAX30102 registers are only ever written as [reg] or "
@@ -129,37 +141,56 @@ class DeviceSim:
 
     def read(self, n_bytes):
         """Handle a read transaction of n_bytes starting at the pointer."""
-        reg = self._addr_ptr
-        if reg == REG_FIFO_DATA:
-            data = self._pop_fifo(n_bytes)
-            # On real silicon, reading FIFO_DATA advances the device's own
-            # internal read pointer (that's how the driver's check() avoids
-            # re-reading samples it already consumed). The driver always
-            # issues exactly one FIFO_DATA read transaction per sample
-            # (of active_leds*3 bytes), so one transaction == one sample,
-            # regardless of how many bytes it spans.
+        out = bytearray()
+        for _ in range(n_bytes):
+            reg = self._addr_ptr
+            if reg == REG_FIFO_DATA:
+                out.append(self._fifo_byte())
+                continue
+            out.append(self._get(reg))
+            if reg in (REG_INT_STAT_1, REG_INT_STAT_2):
+                self._registers[reg] = 0  # reading clears the flags (pag. 12)
+            if reg != REG_PART_ID:
+                self._addr_ptr = (reg + 1) & 0xFF
+        return bytes(out)
+
+    def _sample_size(self):
+        return 3 * max(1, self._channels())
+
+    def _fifo_byte(self):
+        if not self._latched:
+            if self._count == 0:
+                return 0x00  # nothing unread: the pointers don't move
             read_ptr = self._get(REG_FIFO_READ_PTR)
+            self._latched = self._slots[read_ptr] or bytes(self._sample_size())
             self._registers[REG_FIFO_READ_PTR] = (read_ptr + 1) & 0x1F
-            return data
-        if n_bytes != 1:
-            raise ValueError(
-                "Only FIFO_DATA (0x07) is ever read as a multi-byte "
-                "register; got n_bytes={0} for register 0x{1:02X}".format(
-                    n_bytes, reg
-                )
-            )
-        return bytes([self._get(reg)])
+            self._count -= 1
+            self._registers[REG_FIFO_OVERFLOW] = 0
+        byte, self._latched = self._latched[0], self._latched[1:]
+        return byte
 
     # -- test-setup helpers (not real I2C traffic) -----------------------
-    def set_write_ptr(self, value):
-        self._registers[REG_FIFO_WRITE_PTR] = value & 0x1F
+    def load_fifo(self, samples, read_ptr=0, overflow=0):
+        """Fill the FIFO with raw samples (one bytes-like per sample), as if
+        the chip had just written them starting at `read_ptr`. 32 samples
+        make WR_PTR == RD_PTR, i.e. a full FIFO."""
+        self._slots = [None] * 32
+        for i, sample in enumerate(samples):
+            self._slots[(read_ptr + i) & 0x1F] = bytes(sample)
+        self._registers[REG_FIFO_READ_PTR] = read_ptr & 0x1F
+        self._registers[REG_FIFO_WRITE_PTR] = (read_ptr + len(samples)) & 0x1F
+        self._registers[REG_FIFO_OVERFLOW] = overflow
+        self._count = len(samples)
+        self._latched = b""
 
-    def set_read_ptr(self, value):
-        self._registers[REG_FIFO_READ_PTR] = value & 0x1F
+    def power_cycle(self):
+        """Supply drops below UVLO and comes back: every register returns to
+        its power-on value, the FIFO is lost and PWR_RDY is set (pag. 12)."""
+        self._reset_to_defaults()
+        self._registers[REG_INT_STAT_1] = PWR_RDY_BIT
 
-    def push_fifo_bytes(self, data):
-        """Queue raw bytes to be served by subsequent FIFO_DATA reads."""
-        self._fifo_queue.extend(data)
+    def unread(self):
+        return self._count
 
     def set_die_temperature(self, int_reg_value, frac_reg_value=0):
         """Poke raw TINT/TFRAC register bytes (e.g. 0xF6 for -10 degC, per
@@ -174,7 +205,7 @@ class DeviceSim:
     def _mode(self):
         return self._get(REG_MODE_CONFIG) & 0x07
 
-    def _slots(self):
+    def _slots_config(self):
         cfg1 = self._get(REG_MULTI_LED_CONFIG_1)
         cfg2 = self._get(REG_MULTI_LED_CONFIG_2)
         return [cfg1 & 0x07, (cfg1 >> 4) & 0x07, cfg2 & 0x07, (cfg2 >> 4) & 0x07]
@@ -194,7 +225,7 @@ class DeviceSim:
             return {1}
         if self._mode() == MODE_SPO2:
             return {1, 2}
-        return {slot for slot in self._slots() if slot in (1, 2)}
+        return {slot for slot in self._slots_config() if slot in (1, 2)}
 
     def led_current_ma(self, led):
         """Pulse current of LED1 or LED2: 0.2mA per LEDx_PA step (Table 8),
@@ -229,42 +260,46 @@ class DeviceSim:
         """Unread samples in the FIFO when A_FULL triggers (pag. 17)."""
         return 32 - (self._get(REG_FIFO_CONFIG) & 0x0F)
 
-    def produce(self, samples):
-        """The chip takes readings: queue `samples` (each a tuple of ADC
-        counts, one per active channel) and advance FIFO_WR_PTR. Returns the
-        number queued: 0 when the chip isn't sampling.
+    def _channels(self):
+        if self._mode() == MODE_HR:
+            return 1
+        if self._mode() == MODE_SPO2:
+            return 2
+        # Each non-zero slot adds a 3-byte channel (pag. 21)
+        return sum(1 for slot in self._slots_config() if slot)
 
-        Raises ValueError for samples this configuration can't produce, or
-        past the 32-sample FIFO depth (overflow isn't modeled).
+    def produce(self, samples):
+        """The chip takes readings: write `samples` (each a tuple of ADC
+        counts, one per active channel) to the FIFO. Returns the number
+        taken: 0 when the chip isn't sampling.
+
+        Raises ValueError for samples this configuration can't produce.
         """
         if not self.is_sampling():
             return 0
-        if self._mode() == MODE_HR:
-            channels = 1
-        elif self._mode() == MODE_SPO2:
-            channels = 2
-        else:
-            # Each non-zero slot adds a 3-byte channel (pag. 21)
-            channels = sum(1 for slot in self._slots() if slot)
+        channels = self._channels()
         bits = 15 + (self._get(REG_PARTICLE_CONFIG) & 0x03)  # Table 7
-        write_ptr = self._get(REG_FIFO_WRITE_PTR)
-        unread = (write_ptr - self._get(REG_FIFO_READ_PTR)) & 0x1F
-        if unread + len(samples) > 32:
-            raise ValueError("the FIFO holds 32 samples (pag. 14)")
+        rollover = self._get(REG_FIFO_CONFIG) & ROLLOVER_BIT
         for sample in samples:
             if len(sample) != channels:
                 raise ValueError("this mode produces {0}-channel samples".format(channels))
+            data = bytearray()
             for value in sample:
                 if not 0 <= value < (1 << bits):
                     raise ValueError("{0} doesn't fit a {1}-bit ADC".format(value, bits))
                 # Left-justified in 18 bits (Table 1), MSB first (Table 2)
                 word = value << (18 - bits)
-                self._fifo_queue.extend(((word >> 16) & 0x03, (word >> 8) & 0xFF, word & 0xFF))
-        self._registers[REG_FIFO_WRITE_PTR] = (write_ptr + len(samples)) & 0x1F
+                data += bytes(((word >> 16) & 0x03, (word >> 8) & 0xFF, word & 0xFF))
+            write_ptr = self._get(REG_FIFO_WRITE_PTR)
+            if self._count == 32:
+                ovf = self._get(REG_FIFO_OVERFLOW)
+                self._registers[REG_FIFO_OVERFLOW] = min(31, ovf + 1)
+                if not rollover:
+                    continue
+                # The oldest sample is overwritten: both pointers move on
+                self._registers[REG_FIFO_READ_PTR] = (write_ptr + 1) & 0x1F
+                self._count -= 1
+            self._slots[write_ptr] = bytes(data)
+            self._registers[REG_FIFO_WRITE_PTR] = (write_ptr + 1) & 0x1F
+            self._count += 1
         return len(samples)
-
-    def _pop_fifo(self, n_bytes):
-        out = bytearray()
-        for _ in range(n_bytes):
-            out.append(self._fifo_queue.popleft() if self._fifo_queue else 0x00)
-        return bytes(out)
