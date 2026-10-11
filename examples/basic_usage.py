@@ -19,6 +19,10 @@ is computed and printed. It differs from the sample rate, because the sensor pro
 and averages the samples before putting them into the FIFO queue (by default, 8 samples are
 averaged).
 
+The sensor's FIFO holds 32 samples: 0.64 s at 50 samples/s. The loop polls every
+POLL_INTERVAL_S, well inside that, and sleeps in between instead of keeping the CPU and the
+I2C bus busy.
+
 Author: n-elia
 """
 import time
@@ -28,6 +32,10 @@ from max30102 import MAX30102, MAX30105_PULSE_AMP_MEDIUM, scan
 # I2C bus number. On a Raspberry Pi, bus 1 is the usual /dev/i2c-1 header;
 # run `i2cdetect -y 1` to confirm.
 I2C_BUS = 1
+
+# Seconds between polls: at most ~1/3 of the time the FIFO takes to fill
+# (32 / 50 samples/s = 0.64 s), leaving slack for a slow loop iteration
+POLL_INTERVAL_S = 0.1
 
 
 def main():
@@ -62,8 +70,6 @@ def main():
         # Set LED brightness to a medium value
         sensor.set_active_leds_amplitude(MAX30105_PULSE_AMP_MEDIUM)
 
-        time.sleep(1)
-
         # The read_temperature() method allows to extract the die temperature in degC
         print("Reading temperature in degC.\n")
         print(sensor.read_temperature())
@@ -72,16 +78,32 @@ def main():
         compute_frequency = True
 
         print("Starting data acquisition from RED & IR registers...\n")
-        time.sleep(1)
+
+        # The sensor has been sampling since setup_sensor(): start from an
+        # empty FIFO, or the first read would be a FIFO that overflowed
+        # while we were busy above
+        sensor.clear_fifo()
 
         t_start = time.monotonic()  # Starting time of the acquisition
         samples_n = 0  # Number of samples that have been collected
+        lost_samples = 0
 
         while True:
-            # The check() method has to be continuously polled, to check if
+            time.sleep(POLL_INTERVAL_S)
+
+            # The check() method has to be polled regularly, to check if
             # there are new readings into the sensor's FIFO queue. When new
             # readings are available, this function will put them into the storage queue.
-            sensor.check()
+            try:
+                sensor.check()
+            except OSError as e:
+                # A loose wire or bus glitch: the unread samples stay in the
+                # sensor, so just try again on the next poll
+                print("I2C error, retrying:", e)
+                continue
+            if sensor.lost_samples != lost_samples:
+                print("lost", sensor.lost_samples - lost_samples, "samples: the loop fell behind")
+                lost_samples = sensor.lost_samples
 
             # Drain all queued samples from the queue
             while sensor.available():

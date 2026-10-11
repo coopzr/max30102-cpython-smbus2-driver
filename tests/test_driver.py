@@ -87,12 +87,9 @@ def test_fifo_bytes_to_int_matches_manual_unpack():
 # --------------------------------------------------------------------------
 
 def _stage_samples(device, samples):
-    """Point write_ptr/read_ptr at `len(samples)` fresh, unread samples and
-    queue their raw bytes -- as if the sensor had just filled its FIFO."""
-    device.set_read_ptr(0)
-    device.set_write_ptr(len(samples))
-    for sample in samples:
-        device.push_fifo_bytes(bytes(sample))
+    """Fill the FIFO with `samples` (raw bytes per sample), unread -- as if
+    the sensor had just written them."""
+    device.load_fifo([bytes(sample) for sample in samples])
 
 
 def test_get_red_returns_newest_sample_and_drains_backlog():
@@ -392,22 +389,190 @@ def test_check_returns_zero_falsy_when_no_new_data():
 
 
 # --------------------------------------------------------------------------
-# Host-side buffer holds as many samples as the 32-sample device FIFO
+# check(): one status/pointer burst, one FIFO burst, full FIFO, overflow
 # --------------------------------------------------------------------------
 
-def test_storage_queue_size_matches_device_fifo_depth():
-    assert mod.STORAGE_QUEUE_SIZE == 32
+def _transactions(bus, since):
+    return bus.log[since:]
 
 
-def test_buffer_retains_a_full_32_sample_burst():
-    # Tests CircularBuffer/STORAGE_QUEUE_SIZE directly rather than via
-    # check(): the FIFO pointers are 5-bit (pag. 13), so check() can only
-    # see a 0-31 sample backlog (32 new samples looks the same as 0).
+def test_check_uses_one_transaction_for_pointers_and_one_for_data():
+    sensor, device, bus = _make_sensor()
+    sensor.setup_sensor(led_mode=2)
+    device.produce([(1000, 2000), (1001, 2001), (1002, 2002)])
+    since = len(bus.log)
+    assert sensor.check() == 3
+    # FakeSMBus logs each i2c_msg: [W 0x00, R 7 bytes] then [W 0x07, R 3*6]
+    log = _transactions(bus, since)
+    assert [(kind, len(data)) for kind, _, data in log] == [("W", 1), ("R", 7), ("W", 1), ("R", 18)]
+    assert log[0][2] == bytes([0x00]) and log[2][2] == bytes([0x07])
+
+
+def test_full_fifo_is_read_not_mistaken_for_empty():
+    # 32 unread samples: WR_PTR == RD_PTR, and OVF_COUNTER > 0 because the
+    # chip already had to discard some (pag. 13)
+    sensor, device, _ = _make_sensor()
+    sensor.setup_sensor(led_mode=2, pulse_width=411)
+    device.load_fifo([(0, 0, n, 0, 1, n) for n in range(32)], read_ptr=7, overflow=5)
+    assert sensor.check() == 32
+    assert sensor.lost_samples == 5
+    reds = [sensor.pop_red_from_storage() for _ in range(32)]
+    assert reds == list(range(32))
+
+
+def test_equal_pointers_without_overflow_is_empty():
+    sensor, device, _ = _make_sensor()
+    sensor.setup_sensor(led_mode=2)
+    device.load_fifo([], read_ptr=9)
+    assert sensor.check() == 0
+    assert sensor.lost_samples == 0
+
+
+def test_exactly_full_fifo_is_read_one_sample_later():
+    # 32 unread and nothing lost yet is indistinguishable from empty
+    # (WR_PTR == RD_PTR, OVF_COUNTER == 0). The next sample overflows it.
+    sensor, device, _ = _make_sensor()
+    sensor.setup_sensor(led_mode=2)
+    device.produce([(n, n) for n in range(32)])
+    assert sensor.check() == 0
+    device.produce([(32, 32)])
+    assert sensor.check() == 32
+    assert sensor.lost_samples == 1
+    assert sensor.pop_red_from_storage() == 1
+
+
+def test_slow_loop_after_overflow_keeps_reading_and_counts_the_loss():
+    # The application stops polling for longer than the FIFO lasts
+    sensor, device, _ = _make_sensor()
+    sensor.setup_sensor(led_mode=2)  # rollover on
+    device.produce([(n, n) for n in range(40)])  # 8 more than fit
+    assert sensor.check() == 32
+    assert sensor.lost_samples == 8
+    assert [sensor.pop_red_from_storage() for _ in range(32)] == list(range(8, 40))
+    # and polling carries on normally afterwards
+    device.produce([(100, 100), (101, 101)])
+    assert sensor.check() == 2
+    assert sensor.lost_samples == 8
+
+
+def test_fifo_read_cut_part_way_is_reread_from_a_sample_boundary():
+    sensor, device, bus = _make_sensor()
+    sensor.setup_sensor(led_mode=2)
+    device.produce([(1000, 2000), (1001, 2001), (1002, 2002)])
+
+    class CutAfterTwoBytes(FakeSMBus):
+        def i2c_rdwr(self, *msgs):
+            if len(msgs) == 2 and bytes(msgs[0]) == bytes([0x07]):
+                self.device.write(bytes(msgs[0]))
+                self.device.read(2)  # bytes clocked out before the fault
+                self.i2c_rdwr = super().i2c_rdwr  # only the first one fails
+                raise OSError(121, "Remote I/O error")
+            return super().i2c_rdwr(*msgs)
+
+    sensor._i2c = CutAfterTwoBytes(device)
+    with pytest.raises(OSError):
+        sensor.check()
+    assert sensor.available() == 0
+    assert sensor.check() == 3
+    assert [sensor.read_sample() for _ in range(3)] == [(1000, 2000), (1001, 2001), (1002, 2002)]
+
+
+def test_bus_error_on_status_read_loses_nothing():
+    sensor, device, _ = _make_sensor()
+    sensor.setup_sensor(led_mode=2)
+    device.produce([(1000, 2000)])
+    sensor._i2c = FakeSMBus(None)  # the wire comes loose
+    with pytest.raises(OSError):
+        sensor.check()
+    sensor._i2c = FakeSMBus(device)
+    assert sensor.check() == 1
+    assert sensor.read_sample() == (1000, 2000)
+
+
+# --------------------------------------------------------------------------
+# check(): power-on reset detection (PWR_RDY)
+# --------------------------------------------------------------------------
+
+def test_power_cycle_restores_configuration_and_sampling():
+    sensor, device, _ = _make_sensor()
+    sensor.setup_sensor(led_mode=2, sample_rate=100, sample_avg=4, pulse_width=411,
+                        led_power=0x24)
+    configured = {reg: device._get(reg) for reg in mod.MAX30105_RESTORE_ORDER}
+    device.produce([(1000, 2000)])
+    assert sensor.check() == 1
+
+    device.power_cycle()  # brown-out: registers back to power-on values
+    assert device.produce([(1, 1)]) == 0  # not sampling any more
+    assert sensor.check() == 0
+    assert sensor.power_resets == 1
+    assert {reg: device._get(reg) for reg in mod.MAX30105_RESTORE_ORDER} == configured
+    assert device.led_current_ma(1) == 7.2
+    assert device.fifo_rate_hz() == 25
+
+    device.produce([(1001, 2001)])
+    assert sensor.check() == 1
+    assert sensor.read_sample() == (1000, 2000)  # stored before the reset
+    assert sensor.read_sample() == (1001, 2001)
+
+
+def test_stale_power_up_flag_does_not_trigger_a_restore():
+    # PWR_RDY from the original power-up is still set when nothing has read
+    # INT_STATUS_1 (no setup_sensor() soft reset here)
+    sensor, device, bus = _make_sensor()
+    sensor.set_led_mode(2)
+    sensor.set_pulse_width(411)
+    sensor.set_sample_rate(100)
+    device.produce([(1000, 2000)])
+    writes_before = [entry for entry in bus.log if entry[0] == "W" and len(entry[2]) == 2]
+    assert sensor.check() == 1
+    assert sensor.power_resets == 0
+    writes_after = [entry for entry in bus.log if entry[0] == "W" and len(entry[2]) == 2]
+    assert writes_after == writes_before
+
+
+def test_configuration_changed_after_first_check_is_what_gets_restored():
+    sensor, device, _ = _make_sensor()
+    sensor.setup_sensor(led_mode=2)
+    sensor.check()
+    sensor.set_pulse_amplitude_ir(0x10)
+    device.power_cycle()
+    sensor.check()
+    assert device._get(mod.MAX30105_LED2_PULSE_AMP) == 0x10
+
+
+# --------------------------------------------------------------------------
+# Host-side storage: large, and losses are counted
+# --------------------------------------------------------------------------
+
+def test_storage_keeps_several_fifo_reads_between_pops():
+    sensor, device, _ = _make_sensor()
+    sensor.setup_sensor(led_mode=2)
+    for burst in range(4):
+        device.produce([(burst * 30 + n, 0) for n in range(30)])
+        assert sensor.check() == 30
+    assert sensor.available() == 120
+    assert sensor.dropped_samples == 0
+    assert sensor.pop_red_from_storage() == 0
+
+
+def test_storage_overflow_is_counted():
     sensor, _, _ = _make_sensor()
-    for n in range(40):
+    sensor.setup_sensor(led_mode=2)
+    for n in range(mod.STORAGE_QUEUE_SIZE + 5):
         sensor.sense.red.append(n)
-    assert len(sensor.sense.red) == 32
-    assert sensor.available() == 32
+        sensor.sense.IR.append(n)
+    assert sensor.available() == mod.STORAGE_QUEUE_SIZE
+    assert sensor.dropped_samples == 5
+
+
+def test_read_sample_drains_a_backlog_without_polling():
+    sensor, device, bus = _make_sensor()
+    sensor.setup_sensor(led_mode=2)
+    device.produce([(1000 + n, 2000 + n) for n in range(5)])
+    assert sensor.read_sample() == (1000, 2000)
+    since = len(bus.log)
+    assert [sensor.read_sample() for _ in range(4)] == [(1000 + n, 2000 + n) for n in range(1, 5)]
+    assert len(bus.log) == since
 
 
 # --------------------------------------------------------------------------

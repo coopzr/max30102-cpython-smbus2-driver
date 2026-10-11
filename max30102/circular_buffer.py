@@ -4,9 +4,10 @@ from collections import deque
 class CircularBuffer(object):
     ''' Very simple implementation of a circular buffer based on deque '''
     def __init__(self, max_size):
-        # When full, appending pops the oldest item out
+        # When full, appending pops the oldest item out (counted in `dropped`)
         self.data = deque(maxlen=max_size)
         self.max_size = max_size
+        self.dropped = 0
 
     def __len__(self):
         return len(self.data)
@@ -15,6 +16,8 @@ class CircularBuffer(object):
         return not bool(self.data)
 
     def append(self, item):
+        if len(self.data) == self.max_size:
+            self.dropped += 1
         self.data.append(item)
 
     def pop(self):

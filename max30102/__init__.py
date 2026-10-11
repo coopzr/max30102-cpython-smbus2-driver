@@ -86,6 +86,10 @@ MAX30105_INT_DIE_TEMP_RDY_MASK = ~0b00000010
 MAX30105_INT_DIE_TEMP_RDY_ENABLE = 0x02
 MAX30105_INT_DIE_TEMP_RDY_DISABLE = 0x00
 
+# INT_STATUS_1 power-ready flag: set at power-up, cleared by reading INT_STATUS_1
+# (datasheet pag. 12)
+MAX30105_INT_PWR_RDY = 0x01
+
 # Die Temperature Config: self-clearing "start a conversion" bit (pag. 22)
 MAX30105_TEMP_EN = 0x01
 
@@ -163,9 +167,23 @@ SLOT_GREEN_PILOT = 0x07
 
 MAX_30105_EXPECTED_PART_ID = 0x15
 
-# Size of the queued readings. Matches the 32-sample device FIFO (datasheet
-# pag. 9), so that a full FIFO read by check() is not truncated.
-STORAGE_QUEUE_SIZE = 32
+# Samples the host-side storage holds per channel. Far more than one FIFO
+# (32), so an application can call check() several times between pops without
+# losing data; the limit only stops a channel the application never pops
+# (e.g. red, when only IR is used) from growing forever. Samples pushed out
+# are counted in MAX30102.dropped_samples.
+STORAGE_QUEUE_SIZE = 4096
+
+# Registers a power-on reset clears, in the order they are written back:
+# MODE_CONFIG last, so the chip starts sampling only once the rest is set
+MAX30105_RESTORE_ORDER = (
+    MAX30105_INT_ENABLE_1, MAX30105_INT_ENABLE_2, MAX30105_FIFO_CONFIG,
+    MAX30105_PARTICLE_CONFIG, MAX30105_LED1_PULSE_AMP, MAX30105_LED2_PULSE_AMP,
+    MAX30105_LED3_PULSE_AMP, MAX30105_LED_PROX_AMP, MAX30105_MULTI_LED_CONFIG_1,
+    MAX30105_MULTI_LED_CONFIG_2, MAX30105_PROX_INT_THRESH, MAX30105_MODE_CONFIG,
+)
+# MODE_CONFIG bits that read back as written (RESET self-clears, pag. 18)
+MAX30105_MODE_CONFIG_READBACK_MASK = 0x87
 
 # Allowed pulse widths for each sample rate (datasheet pag. 23): Table 12 for
 # HR mode (led_mode=1), Table 11 for SpO2 / multi-LED mode (led_mode=2, 3).
@@ -244,6 +262,15 @@ class MAX30102(object):
         self._acq_frequency_inv = None
         # Circular buffer of readings from the sensor
         self.sense = SensorData()
+        # Every configuration value written, so it can be restored if the
+        # sensor loses power (see check())
+        self._config = {}
+        # Samples the sensor discarded because its FIFO was full. Its counter
+        # saturates at 31 between two check() calls, so this is a lower bound.
+        self.lost_samples = 0
+        # Times check() found the sensor had been power-cycled (e.g. a
+        # brown-out) and restored its configuration
+        self.power_resets = 0
 
     # Sensor setup method
     def setup_sensor(self, led_mode=2, adc_range=16384, sample_rate=400,
@@ -393,6 +420,7 @@ class MAX30102(object):
 
         # Reset the stored config values to the power-on-state values that
         # the registers now hold (datasheet pag. 18)
+        self._config.clear()
         self._active_leds = None
         self._multi_led_read_mode = None
         self._pulse_width = MAX30105_PULSE_WIDTH_69
@@ -675,9 +703,9 @@ class MAX30102(object):
     def get_overflow_count(self):
         """Read OVF_COUNTER (register 0x05): the number of samples lost
         because the FIFO was full (saturates at 31). The chip resets it to
-        0 whenever a sample is read from the FIFO (datasheet pag. 13), so
-        call this before check(). Useful to check that the polling loop
-        keeps up.
+        0 whenever a sample is read from the FIFO (datasheet pag. 13).
+        check() already adds it to `lost_samples` on every call, which is
+        usually what you want instead.
         """
         return ord(self.i2c_read_register(MAX30105_FIFO_OVERFLOW))
 
@@ -762,7 +790,18 @@ class MAX30102(object):
 
     def i2c_set_register(self, REGISTER, VALUE):
         self._i2c.i2c_rdwr(i2c_msg.write(self.i2c_address, bytes([REGISTER, VALUE])))
+        if REGISTER in MAX30105_RESTORE_ORDER:
+            self._config[REGISTER] = VALUE
         return
+
+    # Register address and data in one combined transaction (repeated START):
+    # nothing can happen on the bus between the two, and it is one transfer
+    # instead of two
+    def i2c_read_burst(self, REGISTER, n_bytes):
+        write = i2c_msg.write(self.i2c_address, bytes([REGISTER]))
+        read = i2c_msg.read(self.i2c_address, n_bytes)
+        self._i2c.i2c_rdwr(write, read)
+        return bytes(read)
 
     # Given a register, read it, mask it, and then set the thing
     def set_bitmask(self, REGISTER, MASK, NEW_VALUES):
@@ -783,14 +822,24 @@ class MAX30102(object):
         value = unpack(">i", b'\x00' + fifo_bytes)
         return (value[0] & 0x3FFFF) >> (3 - self._pulse_width)
 
-    # Returns how many samples are available on every active channel (FIFO
-    # channel 1 is stored in sense.IR with swap_red_ir=True, see check())
-    def available(self):
+    # The storage of each active channel, in FIFO order (FIFO channel 1 is
+    # stored in sense.IR with swap_red_ir=True, see check())
+    def _active_channels(self):
         if self._swap_red_ir:
             channels = (self.sense.IR, self.sense.red, self.sense.green)
         else:
             channels = (self.sense.red, self.sense.IR, self.sense.green)
-        return min(len(c) for c in channels[:self._active_leds or 1])
+        return channels[:self._active_leds or 1]
+
+    # Returns how many samples are available on every active channel
+    def available(self):
+        return min(len(c) for c in self._active_channels())
+
+    @property
+    def dropped_samples(self):
+        """Samples read from the sensor but pushed out of storage before the
+        application popped them (STORAGE_QUEUE_SIZE per channel)."""
+        return max(c.dropped for c in self._active_channels())
 
     # Get a new red value
     def get_red(self):
@@ -830,16 +879,19 @@ class MAX30102(object):
             return 0
 
     def read_sample(self):
-        """Poll for new data and return the oldest unread (red, ir) pair,
-        taken from the same reading, or None if no new data arrives within
-        250ms. Needs led_mode=2 or higher (RED + IR).
+        """Return the oldest unread (red, ir) pair, both taken from the same
+        reading. Polls the sensor only when storage is empty, and returns
+        None if no new data arrives within 250ms. Needs led_mode=2 or higher
+        (RED + IR).
         """
         if self._active_leds is None or self._active_leds < 2:
             raise ValueError(
                 'read_sample() needs led_mode=2 or higher (RED+IR); '
                 'call setup_sensor()/set_led_mode() first'
             )
-        if not self.safe_check(250):
+        # Serving storage first is what lets a caller slower than the
+        # sample rate catch up on a backlog instead of skipping it
+        if not self.available() and not self.safe_check(250):
             return None
         return self.pop_red_from_storage(), self.pop_ir_from_storage()
 
@@ -874,50 +926,100 @@ class MAX30102(object):
 
     # Polls the sensor for new data
     def check(self):
-        # Call continuously to poll the sensor for new data.
-        # Returns the number of samples read (0 if there was no new data).
+        """Read every new sample from the sensor's FIFO into storage.
+
+        Call it at least every ~1/3 of the time the 32-sample FIFO takes to
+        fill (0.21s at 50 samples/s), sleeping in between. Returns the number
+        of samples read (0 if there was no new data).
+
+        Samples the sensor had to discard because the FIFO was full are
+        added to `lost_samples`. If the sensor was power-cycled, check()
+        restores its configuration, counts it in `power_resets` and returns
+        0. On a bus error it raises OSError and leaves the unread samples in
+        the FIFO, so calling check() again loses nothing.
+
+        Reading the status registers clears the interrupt flags (pag. 12),
+        so don't rely on get_int_1()/get_int_2() or the INT pin alongside it.
+        """
         self._check_led_mode_set('check()')
-        read_pointer = ord(self.get_read_pointer())
-        write_pointer = ord(self.get_write_pointer())
+        # INT_STATUS_1 through FIFO_RD_PTR (0x00-0x06) in one transaction: a
+        # sample arriving between two separate pointer reads would make the
+        # count wrong, and INT_STATUS_1 holds PWR_RDY
+        status, _, _, _, write_pointer, overflow, read_pointer = \
+            self.i2c_read_burst(MAX30105_INT_STAT_1, 7)
 
-        # Do we have new data?
-        if read_pointer != write_pointer:
-            # Calculate the number of readings we need to get from sensor
-            number_of_samples = write_pointer - read_pointer
-
-            # Wrap condition (return to the beginning of 32 samples)
-            if number_of_samples < 0:
-                number_of_samples += 32
-
-            for i in range(number_of_samples):
-                # Read a number of bytes equal to activeLEDs*3 (= 1 sample)
-                fifo_bytes = self.i2c_read_register(MAX30105_FIFO_DATA,
-                                                    self._multi_led_read_mode)
-
-                # Convert the readings from bytes to integers, depending
-                # on the number of active LEDs. FIFO channel 1 is red and
-                # channel 2 is IR per the datasheet; swap_red_ir reverses
-                # that for boards whose LEDs are physically swapped.
-                if self._swap_red_ir:
-                    first, second = self.sense.IR, self.sense.red
-                else:
-                    first, second = self.sense.red, self.sense.IR
-
-                if self._active_leds > 0:
-                    first.append(self.fifo_bytes_to_int(fifo_bytes[0:3]))
-
-                if self._active_leds > 1:
-                    second.append(self.fifo_bytes_to_int(fifo_bytes[3:6]))
-
-                if self._active_leds > 2:
-                    self.sense.green.append(
-                        self.fifo_bytes_to_int(fifo_bytes[6:9])
-                    )
-
-            return number_of_samples
-
-        else:
+        if status & MAX30105_INT_PWR_RDY and self._lost_configuration():
+            self._restore_configuration()
             return 0
+
+        write_pointer &= 0x1F
+        read_pointer &= 0x1F
+        overflow &= 0x1F
+        number_of_samples = (write_pointer - read_pointer) & 0x1F
+        if overflow:
+            self.lost_samples += overflow
+            # The pointers are 5-bit: a full FIFO has WR_PTR == RD_PTR, just
+            # like an empty one. Only the overflow count tells them apart.
+            # (Exactly 32 unread with nothing lost yet still looks empty; the
+            # next sample overflows it, and the next call reads it as full.)
+            if number_of_samples == 0:
+                number_of_samples = 32
+        if number_of_samples == 0:
+            return 0
+
+        sample_size = self._multi_led_read_mode
+        try:
+            fifo_bytes = self.i2c_read_burst(MAX30105_FIFO_DATA,
+                                             number_of_samples * sample_size)
+        except OSError:
+            # A transfer cut part-way can leave the chip mid-sample. Writing
+            # RD_PTR back makes the next call re-read these samples from a
+            # sample boundary: the recovery the datasheet gives for
+            # communication errors (pag. 13).
+            try:
+                self.i2c_set_register(MAX30105_FIFO_READ_PTR, read_pointer)
+            except OSError:
+                pass
+            raise
+
+        # FIFO channel 1 is red and channel 2 is IR per the datasheet;
+        # swap_red_ir reverses that for boards whose LEDs are physically
+        # swapped.
+        if self._swap_red_ir:
+            first, second = self.sense.IR, self.sense.red
+        else:
+            first, second = self.sense.red, self.sense.IR
+
+        for start in range(0, len(fifo_bytes), sample_size):
+            sample = fifo_bytes[start:start + sample_size]
+            if self._active_leds > 0:
+                first.append(self.fifo_bytes_to_int(sample[0:3]))
+            if self._active_leds > 1:
+                second.append(self.fifo_bytes_to_int(sample[3:6]))
+            if self._active_leds > 2:
+                self.sense.green.append(self.fifo_bytes_to_int(sample[6:9]))
+
+        return number_of_samples
+
+    def _lost_configuration(self):
+        # PWR_RDY may still be set from the original power-up: a soft reset
+        # doesn't trigger it (pag. 18), but nothing says it clears it either.
+        # A real power loss always zeroes MODE_CONFIG, so that tells the two
+        # apart.
+        mode = ord(self.i2c_read_register(MAX30105_MODE_CONFIG))
+        expected = self._config.get(MAX30105_MODE_CONFIG, 0)
+        return ((mode ^ expected) & MAX30105_MODE_CONFIG_READBACK_MASK) != 0
+
+    def _restore_configuration(self):
+        # The FIFO lost its contents with the power; start it empty, before
+        # MODE_CONFIG restarts sampling
+        self.i2c_set_register(MAX30105_FIFO_WRITE_PTR, 0)
+        self.i2c_set_register(MAX30105_FIFO_OVERFLOW, 0)
+        self.i2c_set_register(MAX30105_FIFO_READ_PTR, 0)
+        for reg in MAX30105_RESTORE_ORDER:
+            if reg in self._config:
+                self.i2c_set_register(reg, self._config[reg])
+        self.power_resets += 1
 
     # Check for new data but give up after a certain amount of time
     def safe_check(self, max_time_to_check):
