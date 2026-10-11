@@ -25,8 +25,7 @@ This project incorporates code from the following open-source projects.
 > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 > SOFTWARE.
 
-2. [aromring/MAX30102_by_RF](https://github.com/aromring/MAX30102_by_RF) (`algorithm_by_RF.cpp`, ported to Python in
-   `max30102/hr_spo2.py`)
+2. [aromring/MAX30102_by_RF](https://github.com/aromring/MAX30102_by_RF) (`algorithm_by_RF.cpp`)
 > Copyright (C) 2017 Robert Fraczkiewicz, All Rights Reserved.
 >
 > Permission is hereby granted, free of charge, to any person obtaining a
